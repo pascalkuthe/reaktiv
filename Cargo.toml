@@ -1,0 +1,23 @@
+[package]
+name = "reaktiv"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "A standalone, flexible fine-grained reactivity library"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/pascalkuthe/reaktiv"
+keywords = ["reactive", "reactivity", "signals", "effects"]
+categories = ["data-structures", "rust-patterns"]
+
+[dependencies]
+cov-mark = "2"
+foldhash = "0.2"
+indexmap = "2"
+parking_lot = "0.12"
+papaya = "0.1"
+slab = "0.4"
+tokio = { version = "1", features = ["rt", "time", "sync"] }
+smallvec = "1.15"
+
+[dev-dependencies]
+cov-mark = "2"

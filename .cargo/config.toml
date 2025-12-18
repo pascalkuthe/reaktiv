@@ -1,0 +1,24 @@
+[env]
+# Tests must run single-threaded due to global reactive runtime.
+# See CONTRIBUTING.md for details.
+RUST_TEST_THREADS = "1"
+
+[target.'cfg(all())']
+rustflags = [
+    "-Wclippy::match_same_arms",
+    "-Wclippy::uninlined_format_args",
+    "-Wclippy::if_not_else",
+    "-Wclippy::unnested_or_patterns",
+    "-Wclippy::trivially_copy_pass_by_ref",
+    "-Wclippy::redundant_else",
+    "-Wclippy::match_wildcard_for_single_variants",
+    "-Wclippy::bool_to_int_with_if",
+    "-Wclippy::explicit_into_iter_loop",
+    "-Wclippy::explicit_iter_loop",
+    "-Wclippy::cloned_instead_of_copied",
+    "-Wclippy::filter_map_next",
+    "-Wclippy::match_bool",
+    "-Wclippy::map_unwrap_or",
+    "-Wclippy::redundant_closure_for_method_calls",
+    "-Wclippy::dbg_macro",
+]
