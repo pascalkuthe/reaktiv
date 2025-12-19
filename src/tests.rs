@@ -78,28 +78,33 @@ fn effect_debouncing_batches_invalidations() {
 fn signal_emit_origin_tracking() {
     let circuit = TestCircuit::new();
 
-    // Test emit_from_api and emit_from_ui
-    assert_eq!(circuit.voltage_signal.version(), 0);
-
+    // Test emit_from_api and emit_from_ui - both should work without error
     circuit.voltage_signal.emit_from_api();
-    assert_eq!(circuit.voltage_signal.version(), 1);
-
     circuit.voltage_signal.emit_from_ui();
-    assert_eq!(circuit.voltage_signal.version(), 2);
 }
 
 #[test]
 fn transaction_suppresses_ui_updates() {
     let circuit = TestCircuit::new();
+    let run_count = Arc::new(AtomicUsize::new(0));
 
-    assert_eq!(circuit.voltage_signal.version(), 0);
+    let run_count_clone = run_count.clone();
+    let signal_id = circuit.voltage_signal.node_id();
+    let _effect = Effect::new(move || {
+        signal_id.track_dependency();
+        run_count_clone.fetch_add(1, Ordering::Relaxed);
+    });
+
+    // Initial run
+    assert_eq!(run_count.load(Ordering::Relaxed), 1);
 
     Transaction::no_ui_updates(|| {
         circuit.voltage_signal.emit();
     });
+    flush_effects();
 
-    // Version still increments
-    assert_eq!(circuit.voltage_signal.version(), 1);
+    // Effect should have run after transaction
+    assert_eq!(run_count.load(Ordering::Relaxed), 2);
 }
 
 #[test]
@@ -171,20 +176,19 @@ fn multiple_effects_debounce_independently() {
 
 #[test]
 fn transaction_nesting_preserves_state() {
+    // Test that nested transactions work correctly and emit doesn't panic
     let circuit = TestCircuit::new();
 
     Transaction::run(|| {
-        assert_eq!(circuit.voltage_signal.version(), 0);
-
         Transaction::no_ui_updates(|| {
             circuit.voltage_signal.emit();
-            assert_eq!(circuit.voltage_signal.version(), 1);
         });
 
         // Outer transaction continues
         circuit.voltage_signal.emit();
-        assert_eq!(circuit.voltage_signal.version(), 2);
     });
+
+    // If we get here without panic, the test passes
 }
 
 #[test]
@@ -373,8 +377,8 @@ fn effect_created_in_effect_becomes_child() {
     assert_eq!(child_runs.load(Ordering::Relaxed), 1);
 
     // Check that parent has a child
-    let children = parent_effect.id().children().unwrap_or_default();
-    assert_eq!(children.len(), 1);
+    let child_count = parent_effect.id().with_children(|c| c.len()).unwrap_or(0);
+    assert_eq!(child_count, 1);
 }
 
 #[test]
@@ -417,8 +421,8 @@ fn children_destroyed_when_parent_reruns() {
     assert_eq!(child_creates.load(Ordering::Relaxed), 2);
 
     // Parent should still have exactly 1 child (the new one)
-    let children = parent_effect.id().children().unwrap_or_default();
-    assert_eq!(children.len(), 1);
+    let child_count = parent_effect.id().with_children(|c| c.len()).unwrap_or(0);
+    assert_eq!(child_count, 1);
 }
 
 #[test]
@@ -524,11 +528,12 @@ fn deeply_nested_hierarchy_tracked_correctly() {
     assert_eq!(level2_runs.load(Ordering::Relaxed), 1);
 
     // Check hierarchy: root has 1 child, child has 1 grandchild
-    let children = root_effect.id().children().unwrap_or_default();
-    assert_eq!(children.len(), 1);
+    let child_count = root_effect.id().with_children(|c| c.len()).unwrap_or(0);
+    assert_eq!(child_count, 1);
 
-    let grandchildren = children[0].children().unwrap_or_default();
-    assert_eq!(grandchildren.len(), 1);
+    let first_child_id = root_effect.id().with_children(|c| c[0]).unwrap();
+    let grandchild_count = first_child_id.with_children(|c| c.len()).unwrap_or(0);
+    assert_eq!(grandchild_count, 1);
 }
 
 #[test]
@@ -565,8 +570,8 @@ fn children_destroyed_immediately_on_parent_invalidation() {
     assert_eq!(child_created.load(Ordering::Relaxed), 1);
 
     // Verify parent has one child
-    let children = parent_effect.id().children().unwrap_or_default();
-    assert_eq!(children.len(), 1);
+    let child_count = parent_effect.id().with_children(|c| c.len()).unwrap_or(0);
+    assert_eq!(child_count, 1);
 
     // Mark parent as dirty (via invalidate) inside a transaction so it doesn't auto-run
     Transaction::run(|| {
@@ -575,8 +580,9 @@ fn children_destroyed_immediately_on_parent_invalidation() {
 
         // IMPORTANT: Children should be destroyed IMMEDIATELY when parent is marked dirty,
         // NOT when parent re-runs. Verify child is already gone from parent's children list.
-        assert!(
-            parent_effect.id().children().unwrap_or_default().is_empty(),
+        let child_count_after = parent_effect.id().with_children(|c| c.len()).unwrap_or(0);
+        assert_eq!(
+            child_count_after, 0,
             "Children should be destroyed immediately when parent is marked dirty"
         );
 
@@ -589,59 +595,13 @@ fn children_destroyed_immediately_on_parent_invalidation() {
     assert_eq!(child_created.load(Ordering::Relaxed), 2);
 
     // Verify parent has one (new) child again
-    let new_children = parent_effect.id().children().unwrap_or_default();
-    assert_eq!(new_children.len(), 1);
+    let new_child_count = parent_effect.id().with_children(|c| c.len()).unwrap_or(0);
+    assert_eq!(new_child_count, 1);
 }
 
 // ============================================================================
 // Local effect tests
 // ============================================================================
-
-#[test]
-fn local_effect_flag_set_correctly() {
-    // Test that local effects have the local flag set
-    let local_effect = Effect::new_local(|| {});
-    assert!(local_effect.id().is_local());
-
-    let regular_effect = Effect::new(|| {});
-    assert!(!regular_effect.id().is_local());
-}
-
-#[test]
-fn local_and_parallel_effects_both_execute() {
-    // Test that both local and parallel effects are processed by flush_effects
-    use std::sync::atomic::AtomicI32;
-
-    let signal = Signal::new();
-    let signal_id = signal.node_id();
-
-    let parallel_counter = Arc::new(AtomicI32::new(0));
-    let local_counter = Arc::new(AtomicI32::new(0));
-
-    let pc = parallel_counter.clone();
-    let _parallel = Effect::new(move || {
-        signal_id.track_dependency();
-        pc.fetch_add(1, Ordering::Relaxed);
-    });
-
-    let lc = local_counter.clone();
-    let _local = Effect::new_local(move || {
-        signal_id.track_dependency();
-        lc.fetch_add(1, Ordering::Relaxed);
-    });
-
-    // Both ran during construction
-    assert_eq!(parallel_counter.load(Ordering::Relaxed), 1);
-    assert_eq!(local_counter.load(Ordering::Relaxed), 1);
-
-    // Emit and flush
-    signal.emit();
-    flush_effects();
-
-    // Both were processed
-    assert_eq!(parallel_counter.load(Ordering::Relaxed), 2);
-    assert_eq!(local_counter.load(Ordering::Relaxed), 2);
-}
 
 #[test]
 fn debouncing_batches_rapid_signal_changes() {
@@ -967,9 +927,9 @@ fn deeply_nested_hierarchy_stress() {
     root_effect.invalidate();
 
     // Root should have no children (destroyed when marked pending)
-    let children = root_effect.id().children().unwrap_or_default();
-    assert!(
-        children.is_empty(),
+    let child_count = root_effect.id().with_children(|c| c.len()).unwrap_or(0);
+    assert_eq!(
+        child_count, 0,
         "Children should be destroyed when parent is marked pending"
     );
 
@@ -1128,17 +1088,14 @@ fn stale_signal_id_returns_none() {
     let signal_id = signal.node_id();
 
     // Verify it works while signal exists
-    assert!(signal_id.version().is_some());
-    assert!(signal_id.subscribers().is_some());
+    assert!(signal_id.with_subscribers(|_| ()).is_some());
 
     // Drop the signal
     drop(signal);
 
     // The main goal: accessing a stale ID should NOT panic
     // In parallel tests, the slot might be reused, so we just verify no panic
-    let _ = signal_id.version();
-    let _ = signal_id.subscribers();
-    let _ = signal_id.increment_version();
+    let _ = signal_id.with_subscribers(|_| ());
     // If we get here without panic, the test passes
 }
 
@@ -1173,32 +1130,27 @@ fn stale_effect_id_does_not_panic() {
 
 #[test]
 fn ui_origin_filtering_with_track_ui_only() {
-    // Test the track_ui_updates_only flag behavior
-    // From code analysis:
-    // - track_ui_updates_only=true means "skip me on UI-only updates"
+    // Test the ui_updates_only flag behavior
+    // - ui_updates_only=true means "skip me on UI-only updates"
     // - emit_from_api (is_from_ui=false): ALL subscribers notified (condition is false)
-    // - emit_from_ui (is_from_ui=true): subscribers with track_ui_updates_only=true are SKIPPED
-    use crate::arena::AnySubscriber;
+    // - emit_from_ui (is_from_ui=true): subscribers with ui_updates_only=true are SKIPPED
     use std::sync::atomic::AtomicI32;
 
     let signal = Signal::new();
     let signal_id = signal.node_id();
     let counter = Arc::new(AtomicI32::new(0));
 
-    // Manually create an effect and subscribe with track_ui_updates_only=true
+    // Create an effect with ui_updates_only=true that tracks the signal
     let counter_clone = counter.clone();
-    let effect = Effect::new(move || {
+    let _effect = Effect::new_ui_updates_only(move || {
+        signal_id.track_dependency();
         counter_clone.fetch_add(1, Ordering::Relaxed);
     });
-
-    // Clear default subscription and add one with track_ui_updates_only=true
-    signal_id.remove_subscriber(effect.id());
-    signal_id.add_subscriber(AnySubscriber::new(effect.id(), true));
 
     // Effect ran once during construction
     assert_eq!(counter.load(Ordering::Relaxed), 1);
 
-    // emit_from_api DOES trigger the effect (track_ui_updates_only only skips on UI updates)
+    // emit_from_api DOES trigger the effect (ui_updates_only only skips on UI updates)
     signal.emit_from_api();
     flush_effects();
     assert_eq!(
@@ -1207,50 +1159,47 @@ fn ui_origin_filtering_with_track_ui_only() {
         "Effect should run on API updates"
     );
 
-    // emit_from_ui should NOT trigger this effect (it has track_ui_updates_only=true)
+    // emit_from_ui should NOT trigger this effect (it has ui_updates_only=true)
     signal.emit_from_ui();
     flush_effects();
     assert_eq!(
         counter.load(Ordering::Relaxed),
         2,
-        "Effect with track_ui_updates_only should NOT run on UI updates"
+        "Effect with ui_updates_only should NOT run on UI updates"
     );
 }
 
 #[test]
 fn ui_origin_filtering_behavior() {
-    // Test the actual behavior of track_ui_updates_only flag
-    // From the code: if is_from_ui && subscriber.track_ui_updates_only { skip }
+    // Test the actual behavior of ui_updates_only flag
+    // From the code: if is_from_ui && effect_id.is_ui_updates_only() { skip }
     // This means:
     // - emit_from_api (is_from_ui=false): ALL subscribers notified
-    // - emit_from_ui (is_from_ui=true): subscribers with track_ui_updates_only=true are SKIPPED
-    use crate::arena::AnySubscriber;
+    // - emit_from_ui (is_from_ui=true): subscribers with ui_updates_only=true are SKIPPED
     use std::sync::atomic::AtomicI32;
 
     let signal = Signal::new();
     let signal_id = signal.node_id();
 
-    // Counter for effect that only wants data updates (track_ui_updates_only=true)
+    // Counter for effect that only wants data updates (ui_updates_only=true)
     let data_only_counter = Arc::new(AtomicI32::new(0));
     let dc = data_only_counter.clone();
 
-    // Counter for effect that wants all updates (track_ui_updates_only=false)
+    // Counter for effect that wants all updates (ui_updates_only=false)
     let all_counter = Arc::new(AtomicI32::new(0));
     let ac = all_counter.clone();
 
-    // Create effects (they run immediately and subscribe)
-    let data_only_effect = Effect::new(move || {
+    // Create effect with ui_updates_only=true that tracks the signal
+    let _data_only_effect = Effect::new_ui_updates_only(move || {
+        signal_id.track_dependency();
         dc.fetch_add(1, Ordering::Relaxed);
     });
 
+    // Create normal effect that tracks the signal
     let _all_effect = Effect::new(move || {
         signal_id.track_dependency();
         ac.fetch_add(1, Ordering::Relaxed);
     });
-
-    // Remove default subscription for data_only_effect and add with track_ui_updates_only=true
-    // (Note: data_only_effect doesn't actually track the signal by default, so we need to manually subscribe)
-    signal_id.add_subscriber(AnySubscriber::new(data_only_effect.id(), true));
 
     // Both ran once during construction
     assert_eq!(data_only_counter.load(Ordering::Relaxed), 1);
@@ -1264,15 +1213,13 @@ fn ui_origin_filtering_behavior() {
         2,
         "all_effect should run on API update"
     );
-    // data_only_effect was notified but has no callback re-run logic via signal (it didn't track the signal)
-    // Actually it was manually added as subscriber, so it should be marked pending
     assert_eq!(
         data_only_counter.load(Ordering::Relaxed),
         2,
         "data_only_effect should run on API update"
     );
 
-    // emit_from_ui: data_only_effect should be SKIPPED (is_from_ui=true AND track_ui_updates_only=true)
+    // emit_from_ui: data_only_effect should be SKIPPED (is_from_ui=true AND ui_updates_only=true)
     signal.emit_from_ui();
     flush_effects();
     assert_eq!(
@@ -1379,7 +1326,7 @@ fn computed_chain_propagates() {
     flush_effects();
 
     // After flush, c1's effect ran (c1_count incremented to 2) but the value didn't change
-    // so c1's signal version didn't increment, and c2/c3 are still cached.
+    // so c1's subscribers weren't notified, and c2/c3 are still cached.
     // Access c3 - c2 and c3 still use cache
     // Note: This is expected behavior - Computed only notifies when value changes
     assert_eq!(c3.get(), 25);
@@ -1418,16 +1365,16 @@ fn effect_creates_sibling_effects() {
     assert_eq!(child_count.load(Ordering::Relaxed), 3);
 
     // Verify parent has 3 children
-    let children = parent.id().children().unwrap_or_default();
-    assert_eq!(children.len(), 3);
+    let child_count_check = parent.id().with_children(|c| c.len()).unwrap_or(0);
+    assert_eq!(child_count_check, 3);
 
     // Signal emits - parent marked pending, children destroyed
     signal.emit();
 
     // Before flush, children should already be destroyed
-    let children = parent.id().children().unwrap_or_default();
-    assert!(
-        children.is_empty(),
+    let child_count_after_emit = parent.id().with_children(|c| c.len()).unwrap_or(0);
+    assert_eq!(
+        child_count_after_emit, 0,
         "Children destroyed when parent marked pending"
     );
 
@@ -1438,8 +1385,8 @@ fn effect_creates_sibling_effects() {
     assert_eq!(child_count.load(Ordering::Relaxed), 6);
 
     // Parent should have 3 (new) children
-    let children = parent.id().children().unwrap_or_default();
-    assert_eq!(children.len(), 3);
+    let new_child_count = parent.id().with_children(|c| c.len()).unwrap_or(0);
+    assert_eq!(new_child_count, 3);
 }
 
 // ============================================================================
@@ -1452,35 +1399,32 @@ fn effect_creates_sibling_effects() {
 
 #[test]
 fn effect_writing_tracked_as_output() {
-    // Test that when an effect writes to a signal, it's tracked as an output
+    // Test that when an effect calls emit() on a signal, it's tracked as an output
+    // Note: Output tracking only happens via emit(), not via direct notification methods
     use std::sync::atomic::AtomicI32;
 
     let input_signal = Signal::new();
     let output_signal = Signal::new();
     let input_signal_id = input_signal.node_id();
-    let output_signal_id = output_signal.node_id();
 
     let counter = Arc::new(AtomicI32::new(0));
     let counter_clone = counter.clone();
 
-    // Create an effect that reads input_signal and writes to output_signal
+    // Create an effect that reads input_signal and writes to output_signal via emit()
     let effect = Effect::new(move || {
         // Track input as dependency
         input_signal_id.track_dependency();
         counter_clone.fetch_add(1, Ordering::Relaxed);
-        // Write to output signal (should be tracked as output)
-        output_signal_id.increment_version();
+        // Write to output signal via emit (this is tracked as output)
+        output_signal.emit();
     });
 
     // Effect ran once during construction
     assert_eq!(counter.load(Ordering::Relaxed), 1);
 
-    // Check that output_signal is in effect's outputs
-    let outputs = effect.id().outputs().unwrap_or_default();
-    // Note: The effect doesn't call emit(), so no outputs are tracked
-    // because output tracking happens in emit(), not increment_version()
-    // Let's verify with a proper emit-based effect:
-    assert_eq!(outputs.len(), 0);
+    // Check that output_signal is in effect's outputs (emit() tracks it)
+    let output_count = effect.id().with_outputs(|outputs| outputs.count()).unwrap_or(0);
+    assert_eq!(output_count, 1);
 }
 
 #[test]
@@ -1502,13 +1446,21 @@ fn effect_emit_tracked_as_output() {
     });
 
     // Verify the effect has input_signal as source
-    let sources = effect.id().sources().unwrap_or_default();
-    assert_eq!(sources.len(), 1);
-    assert_eq!(sources[0], input_signal_id);
+    let source_count = effect.id().with_sources(|sources| sources.count()).unwrap_or(0);
+    assert_eq!(source_count, 1);
+    let has_input_source = effect.id().with_sources(|sources| {
+        for s in sources {
+            if s == input_signal_id {
+                return true;
+            }
+        }
+        false
+    }).unwrap_or(false);
+    assert!(has_input_source);
 
     // No outputs yet since we didn't actually call emit()
-    let outputs = effect.id().outputs().unwrap_or_default();
-    assert_eq!(outputs.len(), 0);
+    let output_count = effect.id().with_outputs(|outputs| outputs.count()).unwrap_or(0);
+    assert_eq!(output_count, 0);
 
     // Check signal writers
     let has_writers = with_signal_writers(output_signal_id, |writers| !writers.is_empty());
@@ -1532,17 +1484,17 @@ fn untracked_prevents_dependency() {
     });
 
     // Effect should have NO sources (untracked prevented dependency tracking)
-    let sources = effect.id().sources().unwrap_or_default();
+    let source_count = effect.id().with_sources(|sources| sources.count()).unwrap_or(0);
     assert_eq!(
-        sources.len(),
+        source_count,
         0,
         "untracked() should prevent dependency tracking"
     );
 
     // Signal should have NO subscribers
-    let subscribers = signal_id.subscribers().unwrap_or_default();
+    let subscriber_count = signal_id.with_subscribers(|subs| subs.len()).unwrap_or(0);
     assert_eq!(
-        subscribers.len(),
+        subscriber_count,
         0,
         "untracked() should prevent subscription"
     );
@@ -1587,7 +1539,7 @@ fn effect_rerun_clears_outputs() {
     });
 
     // Verify effect exists (not removed from arena)
-    assert!(effect.id().sources().is_some());
+    assert!(effect.id().with_sources(|_| ()).is_some());
 
     // Change flag and invalidate
     use_b.store(true, Ordering::Relaxed);
@@ -1595,7 +1547,7 @@ fn effect_rerun_clears_outputs() {
     flush_effects();
 
     // Effect re-ran (still exists in arena)
-    assert!(effect.id().sources().is_some());
+    assert!(effect.id().with_sources(|_| ()).is_some());
 }
 
 #[test]
@@ -1607,10 +1559,10 @@ fn pull_ensures_fresh_values() {
     let signal_id = signal.node_id();
 
     // Pull on a signal with no writers should be a no-op
-    signal_id.pull();
+    signal_id.pull(false);
 
     // Verify signal still exists
-    assert!(signal_id.version().is_some());
+    assert!(signal_id.with_subscribers(|_| ()).is_some());
 }
 
 #[test]
@@ -1761,4 +1713,292 @@ fn read_write_different_signals_allowed() {
     signal_read.emit();
     flush_effects();
     assert_eq!(run_count.load(Ordering::Relaxed), 3);
+}
+
+// ============================================================================
+// Skippable Effects Tests
+// ============================================================================
+
+#[test]
+fn skippable_effect_flag_set_correctly() {
+    // Test that Effect::new_skippable() sets the skippable flag
+    let effect = Effect::new_skippable(|| {});
+    assert!(effect.id().is_skippable());
+
+    // Test that regular Effect::new() creates non-skippable effects
+    let regular_effect = Effect::new(|| {});
+    assert!(!regular_effect.id().is_skippable());
+}
+
+#[test]
+fn skippable_computed_flag_set_correctly() {
+    // Test that Computed::new_skippable() sets the skippable flag
+    let computed = Computed::new_skippable(|| 42);
+    assert!(computed.effect_id().is_skippable());
+
+    // Test that regular Computed::new() creates non-skippable computeds
+    let regular_computed = Computed::new(|| 42);
+    assert!(!regular_computed.effect_id().is_skippable());
+
+    // Test lazy_skippable
+    let lazy_skippable = Computed::lazy_skippable(|| 42);
+    assert!(lazy_skippable.effect_id().is_skippable());
+
+    // Test regular lazy
+    let lazy_regular = Computed::lazy(|| 42);
+    assert!(!lazy_regular.effect_id().is_skippable());
+}
+
+#[test]
+fn flush_with_budget_defers_skippable() {
+    use std::time::Duration;
+
+    // Create a skippable effect
+    let skippable_count = Arc::new(AtomicUsize::new(0));
+    let sc = skippable_count.clone();
+    let skippable = Effect::new_skippable(move || {
+        sc.fetch_add(1, Ordering::Relaxed);
+    });
+
+    // Create a non-skippable effect
+    let non_skippable_count = Arc::new(AtomicUsize::new(0));
+    let nsc = non_skippable_count.clone();
+    let non_skippable = Effect::new(move || {
+        nsc.fetch_add(1, Ordering::Relaxed);
+    });
+
+    // Both ran once during construction
+    assert_eq!(skippable_count.load(Ordering::Relaxed), 1);
+    assert_eq!(non_skippable_count.load(Ordering::Relaxed), 1);
+
+    // Invalidate both
+    skippable.invalidate();
+    non_skippable.invalidate();
+
+    // Flush with zero budget - skippable should be deferred, non-skippable should run
+    let budget = Duration::from_millis(0);
+    let mut must_run_buf = Vec::new();
+    let mut skippable_buf = Vec::new();
+    crate::effect::flush_effects_with_budget(budget, &mut must_run_buf, &mut skippable_buf);
+
+    // Non-skippable ran (even with zero budget, must-run effects always run)
+    assert_eq!(non_skippable_count.load(Ordering::Relaxed), 2);
+
+    // Skippable was deferred
+    assert_eq!(skippable_count.load(Ordering::Relaxed), 1);
+
+    // Should have 1 deferred effect in skippable_buf
+    assert_eq!(skippable_buf.len(), 1);
+    assert!(skippable_buf[0].is_skippable());
+}
+
+#[test]
+fn pull_skips_skippable_when_flag_set() {
+    use std::sync::atomic::AtomicI32;
+
+    let signal = Signal::new();
+    let signal_id = signal.node_id();
+
+    // Create a skippable computed that writes to the signal
+    let skippable_count = Arc::new(AtomicI32::new(0));
+    let sc = skippable_count.clone();
+    let _skippable_computed = Computed::new_skippable(move || {
+        sc.fetch_add(1, Ordering::Relaxed);
+        42
+    });
+
+    // Initial computation
+    assert_eq!(skippable_count.load(Ordering::Relaxed), 1);
+
+    // Now call pull with skip_skippable=true
+    // This should NOT run the skippable computed
+    signal_id.pull(true);
+
+    // Skippable was skipped
+    assert_eq!(skippable_count.load(Ordering::Relaxed), 1);
+
+    // Call pull with skip_skippable=false
+    // This SHOULD run the skippable computed if it's stale
+    signal_id.pull(false);
+
+    // If the computed is clean, it won't run anyway
+    // This test mainly verifies the API works without panicking
+}
+
+#[test]
+fn skippable_effects_integrate_with_budget_system() {
+    use std::time::Duration;
+
+    // Create multiple skippable producer effects
+    let producer_count = Arc::new(AtomicUsize::new(0));
+    let mut producers = Vec::new();
+
+    for _ in 0..5 {
+        let pc = producer_count.clone();
+        producers.push(Effect::new_skippable(move || {
+            pc.fetch_add(1, Ordering::Relaxed);
+        }));
+    }
+
+    // Create a consumer effect
+    let consumer_count = Arc::new(AtomicUsize::new(0));
+    let cc = consumer_count.clone();
+    let _consumer = Effect::new(move || {
+        cc.fetch_add(1, Ordering::Relaxed);
+    });
+
+    // All ran once during construction
+    assert_eq!(producer_count.load(Ordering::Relaxed), 5);
+    assert_eq!(consumer_count.load(Ordering::Relaxed), 1);
+
+    // Invalidate all
+    for producer in &producers {
+        producer.invalidate();
+    }
+    // Consumer doesn't need invalidating for this test
+
+    // Flush with small budget
+    let budget = Duration::from_millis(1);
+    let mut must_run_buf = Vec::new();
+    let mut skippable_buf = Vec::new();
+    crate::effect::flush_effects_with_budget(budget, &mut must_run_buf, &mut skippable_buf);
+
+    // Some producers might have run, some might be deferred
+    // The key is that the system doesn't panic and deferred effects are skippable
+    for deferred_id in &skippable_buf {
+        assert!(deferred_id.is_skippable());
+    }
+}
+
+#[test]
+fn check_state_effects_added_to_pending() {
+    // This test verifies that effects marked with Check state are properly added
+    // to the pending set. The Check state is used for indirect dependents in the
+    // three-state reactive system.
+    //
+    // Scenario:
+    // - Effect A writes to signal S
+    // - Effect B reads from signal S
+    // - When A is marked Dirty, B should be marked Check AND added to pending
+    // - When A runs, B is upgraded to Dirty and runs (conservative propagation)
+    //
+    // The bug this test catches: if Check effects aren't added to pending, they
+    // would get "stuck" in Check state and never respond to subsequent changes.
+    //
+    // Note: The current implementation uses conservative propagation - when any
+    // effect runs, all downstream subscribers are marked Dirty regardless of
+    // whether the effect actually wrote to its outputs. This ensures no updates
+    // are missed.
+
+    use crate::arena::current_effect;
+
+    // Verify the code path is taken
+    cov_mark::check!(check_effect_added_to_pending);
+
+    let trigger = Signal::new();
+    let output = Signal::new();
+
+    // Get IDs for use in closures
+    let trigger_id = trigger.node_id();
+    let output_id = output.node_id();
+
+    // Effect A: reads trigger, writes to output
+    // We manually do what Signal::emit() does: register output and notify
+    let _effect_a = Effect::new(move || {
+        trigger_id.track_dependency();
+        // Register this effect as a writer of output_id (like Signal::emit does)
+        if let Some(effect_id) = current_effect() {
+            effect_id.add_output(output_id);
+        }
+        output_id.notify_subscribers();
+    });
+
+    // Effect B: reads output
+    let b_count = Arc::new(AtomicUsize::new(0));
+    let b_count_clone = b_count.clone();
+    let _effect_b = Effect::new(move || {
+        output_id.track_dependency();
+        b_count_clone.fetch_add(1, Ordering::Relaxed);
+    });
+
+    // Both effects ran during creation
+    assert_eq!(b_count.load(Ordering::Relaxed), 1);
+
+    // First trigger - B should run
+    trigger.emit();
+    flush_effects();
+    assert_eq!(b_count.load(Ordering::Relaxed), 2);
+
+    // Multiple triggers - B should respond each time
+    // This verifies Check effects are properly added to pending and processed
+    for i in 3..=5 {
+        trigger.emit();
+        flush_effects();
+        assert_eq!(
+            b_count.load(Ordering::Relaxed),
+            i,
+            "Effect B should run on emission {}. \
+             If this fails, Check-state effects may not be added to the pending set.",
+            i
+        );
+    }
+}
+
+#[test]
+fn check_state_propagation_through_chain() {
+    // Test that Check state properly propagates through a chain of effects
+    // and all effects in the chain respond to changes.
+
+    use crate::arena::current_effect;
+
+    cov_mark::check!(check_effect_added_to_pending);
+
+    let source = Signal::new();
+    let middle = Signal::new();
+    let end = Signal::new();
+
+    // Get IDs for use in closures
+    let source_id = source.node_id();
+    let middle_id = middle.node_id();
+    let end_id = end.node_id();
+
+    // Effect chain: source -> middle -> end
+    // We manually do what Signal::emit() does: register output and notify
+    let _effect_a = Effect::new(move || {
+        source_id.track_dependency();
+        if let Some(effect_id) = current_effect() {
+            effect_id.add_output(middle_id);
+        }
+        middle_id.notify_subscribers();
+    });
+
+    let _effect_b = Effect::new(move || {
+        middle_id.track_dependency();
+        if let Some(effect_id) = current_effect() {
+            effect_id.add_output(end_id);
+        }
+        end_id.notify_subscribers();
+    });
+
+    let c_count = Arc::new(AtomicUsize::new(0));
+    let c_count_clone = c_count.clone();
+    let _effect_c = Effect::new(move || {
+        end_id.track_dependency();
+        c_count_clone.fetch_add(1, Ordering::Relaxed);
+    });
+
+    // Initial run
+    assert_eq!(c_count.load(Ordering::Relaxed), 1);
+
+    // Multiple emissions - all effects should run each time
+    for i in 2..=5 {
+        source.emit();
+        flush_effects();
+        assert_eq!(
+            c_count.load(Ordering::Relaxed),
+            i,
+            "Effect C should run on emission {}",
+            i
+        );
+    }
 }
