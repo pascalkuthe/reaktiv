@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 295 160" width="295" height="160">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 440 130">
   <style>
     .logo-text { fill: #0f172a; }
     @media (prefers-color-scheme: dark) {
@@ -16,8 +16,8 @@
     </linearGradient>
   </defs>
 
-  <!-- Icon group - scaled and positioned with top padding -->
-  <g transform="translate(-55, 7) scale(1.7)">
+  <!-- Icon - flask body matches text cap height, burst extends above like ascenders -->
+  <g transform="translate(5, 30) scale(0.88)">
     <!-- Main flask -->
     <path d="M52 25 L52 38 L36 78 Q34 86 42 90 L78 90 Q86 86 84 78 L68 38 L68 25"
           fill="url(#flaskGrad)"/>
@@ -30,9 +30,7 @@
 
     <!-- Explosion burst -->
     <g fill="url(#burstGrad)">
-      <!-- Central burst -->
       <polygon points="60,5 63,15 70,8 65,18 75,15 67,22 60,20 53,22 45,15 55,18 50,8 57,15"/>
-      <!-- Particles -->
       <circle cx="60" cy="0" r="3"/>
       <circle cx="45" cy="5" r="2.5"/>
       <circle cx="75" cy="5" r="2.5"/>
@@ -50,6 +48,6 @@
     <circle cx="62" cy="25" r="1.5" fill="white" opacity="0.4"/>
   </g>
 
-  <!-- Text "Reaktiv" - to the right, vertically centered -->
-  <text x="105" y="110" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif" font-size="52" font-weight="700" class="logo-text">Reaktiv</text>
+  <!-- Text "Reaktiv" - baseline aligned with flask bottom -->
+  <text x="95" y="100" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif" font-size="68" font-weight="700" class="logo-text">Reaktiv</text>
 </svg>

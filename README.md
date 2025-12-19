@@ -1,5 +1,5 @@
 <p>
-  <img src="docs/logo-with-text.svg" alt="Reaktiv" height="160">
+  <img src="docs/logo-with-text.svg" alt="Reaktiv">
 </p>
 
 [![Crates.io](https://img.shields.io/crates/v/reaktiv.svg)](https://crates.io/crates/reaktiv)
