@@ -1,13 +1,13 @@
-<h1>
-  <img src="docs/logo.svg" alt="reaktiv logo" width="40" height="33" valign="middle">
-  reaktiv
-</h1>
-
-A standalone, flexible fine-grained reactivity library designed to be unintrusive.
+<p>
+  <img src="docs/logo-with-text.svg" alt="Reaktiv" height="160">
+</p>
 
 [![Crates.io](https://img.shields.io/crates/v/reaktiv.svg)](https://crates.io/crates/reaktiv)
 [![Documentation](https://docs.rs/reaktiv/badge.svg)](https://docs.rs/reaktiv)
 [![CI](https://github.com/pascalkuthe/reaktiv/actions/workflows/ci.yml/badge.svg)](https://github.com/pascalkuthe/reaktiv/actions)
+[![MSRV](https://img.shields.io/crates/msrv/reaktiv)](https://crates.io/crates/reaktiv)
+
+A standalone, flexible fine-grained reactivity library designed to be unintrusive.
 
 ## Motivation
 
