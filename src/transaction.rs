@@ -1,7 +1,6 @@
 use crate::effect::flush_effects;
 use std::cell::RefCell;
-use std::sync::{Arc, OnceLock};
-use tokio::sync::Semaphore;
+use std::sync::{Condvar, Mutex, OnceLock};
 
 // Thread-local flag to suppress UI updates
 // When true, all signals get update_ui=false
@@ -15,10 +14,71 @@ thread_local! {
     static TRANSACTION_DEPTH: RefCell<usize> = const { RefCell::new(0) };
 }
 
+/// Global barrier that blocks the effect loop during transactions.
+///
+/// The barrier consists of:
+/// - A counter of active transactions (across all threads)
+/// - A condvar to wake the effect loop when transactions complete
+///
+/// When any transaction is active, the effect loop waits on the condvar.
+/// When all transactions complete, the condvar is notified.
+static TRANSACTION_BARRIER: OnceLock<TransactionBarrier> = OnceLock::new();
+
+struct TransactionBarrier {
+    /// Number of active transactions (0 = effect loop can proceed)
+    active_count: Mutex<usize>,
+    /// Condvar to wake the effect loop when transactions complete
+    condvar: Condvar,
+}
+
+impl TransactionBarrier {
+    fn new() -> Self {
+        Self {
+            active_count: Mutex::new(0),
+            condvar: Condvar::new(),
+        }
+    }
+
+    /// Increment the active transaction count (blocks effect loop)
+    fn enter(&self) {
+        let mut count = self.active_count.lock().unwrap();
+        *count += 1;
+    }
+
+    /// Decrement the active transaction count, notify effect loop if zero
+    fn exit(&self) {
+        let mut count = self.active_count.lock().unwrap();
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            self.condvar.notify_all();
+        }
+    }
+
+    /// Wait until no transactions are active
+    fn wait_until_clear(&self) {
+        let mut count = self.active_count.lock().unwrap();
+        while *count > 0 {
+            count = self.condvar.wait(count).unwrap();
+        }
+    }
+}
+
+fn get_barrier() -> &'static TransactionBarrier {
+    TRANSACTION_BARRIER.get_or_init(TransactionBarrier::new)
+}
+
+/// Wait until no transactions are active.
+///
+/// This is called by the effect loop before processing effects to ensure
+/// effects don't run mid-transaction.
+pub fn wait_for_transactions() {
+    get_barrier().wait_until_clear();
+}
+
 /// RAII guard that ensures transaction cleanup happens even on panic.
 ///
 /// When this guard is dropped (either normally or due to unwinding),
-/// it decrements the transaction depth and potentially releases the permit.
+/// it decrements the transaction depth and potentially flushes effects.
 struct TransactionGuard {
     prev_suppress: bool,
 }
@@ -43,47 +103,18 @@ fn exit_transaction_inner() {
         *depth == 0
     });
 
-    // When exiting outermost transaction:
+    // When exiting outermost transaction on this thread:
     if should_flush {
-        // 1. Release the barrier permit (unblocks async effect processor)
-        HELD_PERMIT.with(|p| {
-            *p.borrow_mut() = None; // Dropping the permit releases it
-        });
+        // 1. Release the global barrier (unblocks effect loop)
+        get_barrier().exit();
 
         // 2. Flush all pending effects synchronously
         // This ensures effects batched during the transaction are processed.
         flush_effects();
 
-        // 3. Notify the async effect loop (in case there are more effects)
+        // 3. Notify the effect loop (in case there are more effects)
         crate::effect::schedule_effect_processing();
     }
-}
-
-// ============================================================================
-// Transaction Barrier (Semaphore)
-// ============================================================================
-
-/// Global semaphore that blocks effect processing during transactions.
-///
-/// The semaphore starts with 1 permit (processing allowed).
-/// When a transaction starts (depth goes from 0 to 1), we acquire the permit.
-/// When the outermost transaction ends (depth goes from 1 to 0), we release the permit.
-///
-/// The async effect loop in executor.rs waits to acquire this permit before
-/// processing effects, ensuring effects don't run mid-transaction.
-static TRANSACTION_BARRIER: OnceLock<Arc<Semaphore>> = OnceLock::new();
-
-/// Get or initialize the transaction barrier.
-pub fn get_transaction_barrier() -> &'static Arc<Semaphore> {
-    TRANSACTION_BARRIER.get_or_init(|| Arc::new(Semaphore::new(1)))
-}
-
-// Owned permit for the transaction barrier.
-//
-// This is stored in a thread-local to allow releasing it when the
-// outermost transaction exits.
-thread_local! {
-    static HELD_PERMIT: RefCell<Option<tokio::sync::OwnedSemaphorePermit>> = const { RefCell::new(None) };
 }
 
 /// Check if currently inside a transaction
@@ -95,24 +126,12 @@ pub fn is_transaction_active() -> bool {
 }
 
 /// Increment transaction depth (entering a transaction)
-///
-/// When entering the first (outermost) transaction, we acquire the transaction
-/// barrier permit. This blocks the async effect loop from processing effects
-/// until the transaction completes.
 fn enter_transaction() {
     TRANSACTION_DEPTH.with(|d| {
         let depth = *d.borrow();
         if depth == 0 {
-            // First transaction level - acquire permit (blocks async processor)
-            // We use try_acquire_owned because we're in a sync context.
-            // If the permit is already held (can happen with concurrent tests),
-            // we proceed anyway since we're already in a transaction context.
-            let barrier = get_transaction_barrier();
-            if let Ok(permit) = barrier.clone().try_acquire_owned() {
-                HELD_PERMIT.with(|p| {
-                    *p.borrow_mut() = Some(permit);
-                });
-            }
+            // First transaction on this thread - acquire global barrier
+            get_barrier().enter();
         }
         *d.borrow_mut() = depth + 1;
     });
@@ -124,36 +143,39 @@ fn is_ui_update_suppressed() -> bool {
     SUPPRESS_UI_UPDATES.with(|s| *s.borrow())
 }
 
-/// Batching context for multiple reactive updates
+/// Batch multiple signal changes into a single effect run
 ///
-/// # Purpose:
-/// - Batch multiple signal changes so dependent effects run once
-/// - Optionally suppress UI refresh flags during transaction
-/// - Prevent UI update loops
+/// Transactions let you update multiple signals while ensuring dependent effects
+/// only run once at the end. This is more efficient than running effects after
+/// each individual change.
 ///
-/// # Behavior:
+/// # How it works
 /// 1. Enter transaction context
-/// 2. Update multiple signals/fields
-/// 3. Effects track dependencies but don't run yet
-/// 4. On transaction exit, all pending effects run once
-/// 5. `no_ui_updates()` variant suppresses UI refresh for internal changes
+/// 2. Update multiple signals - they're marked pending but effects don't run yet
+/// 3. On transaction exit, all pending effects run once
 ///
-/// # Usage:
+/// # Example
 /// ```ignore
-/// // Batch multiple updates
-/// Transaction::run(|| {
-///     circuit.voltage = 10.0;
-///     circuit.frequency = 1e6;
-///     circuit.load = 50.0;
-/// });
-/// // All effects depending on these fields run once at end
+/// // Without transaction: effect runs 3 times
+/// voltage_signal.emit();   // Effect runs
+/// current_signal.emit();   // Effect runs
+/// load_signal.emit();      // Effect runs
 ///
-/// // Suppress UI updates for internal changes
+/// // With transaction: effect runs once
+/// Transaction::run(|| {
+///     voltage_signal.emit();
+///     current_signal.emit();
+///     load_signal.emit();
+/// });  // All effects run once at end
+/// ```
+///
+/// # Suppressing UI updates
+/// Use `no_ui_updates()` to prevent UI-triggered effects from running during
+/// internal updates. This is useful for preventing update loops:
+/// ```ignore
 /// Transaction::no_ui_updates(|| {
-///     component.layout();
-///     component.render();
+///     component.internal_recalculation();
 /// });
-/// // Effects won't try to refresh UI
 /// ```
 pub struct Transaction {
     _suppress_ui: bool,
@@ -197,7 +219,7 @@ impl Transaction {
             *s.borrow_mut() = should_suppress;
         });
 
-        // Enter transaction (defers effect processing)
+        // Enter transaction (defers effect processing, acquires barrier)
         enter_transaction();
 
         // Create RAII guard that will clean up on both normal return and panic.
@@ -224,70 +246,6 @@ mod tests {
         });
 
         assert!(!is_ui_update_suppressed());
-    }
-
-    #[test]
-    fn transaction_acquires_barrier_permit() {
-        // Verify that entering a transaction acquires the barrier permit.
-        // Note: Since tests run in parallel and share the global semaphore,
-        // we check relative state changes rather than absolute permit counts.
-        let barrier = get_transaction_barrier();
-
-        // Record permits before transaction (might be 0 if another test has a transaction active)
-        let permits_before = barrier.available_permits();
-
-        Transaction::run(|| {
-            // Inside transaction: permit count should decrease (or stay at 0 if already 0)
-            let permits_inside = barrier.available_permits();
-            // If we acquired the permit (permits_before was 1), it should now be 0
-            // If permits_before was 0, we didn't acquire (another test holds it)
-            if permits_before > 0 {
-                assert_eq!(permits_inside, permits_before - 1);
-            }
-        });
-
-        // After transaction: permit should be released back to what it was before
-        // (or higher if we released but didn't acquire)
-        let permits_after = barrier.available_permits();
-        // If we successfully acquired in this transaction, permits_after should equal permits_before
-        // This assertion may fail if another test acquired between our exit and this check,
-        // so we just verify it's not less than we started with
-        assert!(
-            permits_after >= permits_before || permits_before == 0,
-            "Permits should be released after transaction: before={permits_before}, after={permits_after}"
-        );
-    }
-
-    #[test]
-    fn nested_transactions_hold_permit_until_outermost_exits() {
-        // Verify that nested transactions only release the permit when the outermost exits.
-        // This test checks behavior relative to the test's own transactions.
-        let barrier = get_transaction_barrier();
-
-        let permits_before = barrier.available_permits();
-
-        Transaction::run(|| {
-            // Permit should be acquired (or already held by another test)
-            let permits_outer = barrier.available_permits();
-            if permits_before > 0 {
-                assert_eq!(permits_outer, permits_before - 1);
-            }
-
-            Transaction::run(|| {
-                // Still held by outermost transaction (same count as outer)
-                assert_eq!(barrier.available_permits(), permits_outer);
-            });
-
-            // Inner transaction exited, but permit still held by outer
-            assert_eq!(barrier.available_permits(), permits_outer);
-        });
-
-        // Outermost transaction exited, permit should be released
-        let permits_after = barrier.available_permits();
-        assert!(
-            permits_after >= permits_before || permits_before == 0,
-            "Permits should be released: before={permits_before}, after={permits_after}"
-        );
     }
 
     #[test]
