@@ -1,4 +1,7 @@
-# reaktiv
+<h1>
+  <img src="docs/logo.svg" alt="reaktiv logo" width="40" height="33" valign="middle">
+  reaktiv
+</h1>
 
 A standalone, flexible fine-grained reactivity library designed to be unintrusive.
 
@@ -6,19 +9,14 @@ A standalone, flexible fine-grained reactivity library designed to be unintrusiv
 [![Documentation](https://docs.rs/reaktiv/badge.svg)](https://docs.rs/reaktiv)
 [![CI](https://github.com/pascalkuthe/reaktiv/actions/workflows/ci.yml/badge.svg)](https://github.com/pascalkuthe/reaktiv/actions)
 
-## Philosophy
+## Motivation
 
-This crate aims to bring the benefits of fine-grained reactivity to contexts beyond traditional web UI. Reactivity is a powerful pattern for managing dependencies and propagating changes - it doesn't have to be tied to a specific framework or runtime.
-
-**Standalone**: No framework assumptions. No runtime requirements. Just a library you call.
-
-**Flexible**: Works with any event loop (Qt, GTK, game loops) or no event loop at all. You control when effects run via explicit `flush_effects()`.
-
-**Unintrusive**: Signals don't wrap your data - they're just lightweight metadata (4 bytes). Your values stay where they belong, in your structs.
+This crate aims to bring the benefits of fine-grained reactivity to contexts beyond traditional web UI. Reactivity is a useful pattern for managing dependencies and propagating changes - it doesn't have to be tied to a specific framework or runtime. At the same time I had performance concerns
+so this crate is also more optimized compared to other crates I found.
 
 ## Example Use Case: Python API Hook System
 
-A compelling use case is building a subscription/hook system for a Python API. When users change parameters through the API, downstream computations need to update automatically:
+The particular use case that motivated this crate was building a subscription/hook system for a Python API (which also has a UI that uses the same reactivity system). When users change parameters through the API, downstream computations need to update automatically:
 
 ```rust
 // Python bindings (via PyO3)
@@ -52,20 +50,32 @@ Fine-grained reactivity automatically tracks dependencies between data and compu
 
 This is distinct from coarse-grained approaches (like virtual DOM diffing) where changes trigger broad re-renders that must be narrowed down afterward.
 
-## vs `reactive_graph` (from Leptos)
+## Compared to `reactive_graph` (from Leptos)
 
-**More low-level.** `reactive_graph` is optimized for WASM and web microtask scheduling. This crate is a primitive building block - no microtask integration, no framework. You control scheduling via explicit `flush_effects()`.
+`reactive_graph` is a good implementation of fine-grained reactivity (and inspired this crate) but ultimately did not fit what I was looking for:
 
-**Intrusive design.** Leptos signals wrap and own your data (`Signal<T>`). Here, signals are just metadata - your values stay in your structs. Lower memory overhead (4 bytes vs 16+).
+* **Less intrusive design**: Leptos signals wrap and own your data (`Signal<T>`). I wanted signals to be just metadata - your values stay in your structs.
+  - The approach Leptos uses can be good for usability as it avoids bugs caused by forgetting to notify signals
+  - But for my use cases I was looking for more control over data ownership
 
-## vs `futures-signals` / `dioxus-signals`
+* **Less overhead**: Reaktiv is carefully optimized and uses ~50% less memory compared to reactive_graph.
+  - Leptos wraps all signal values in `Arc<RwLock<T>>` which adds overhead, especially for simple types
+  - Leptos also uses `Arc<>` for the graph metadata itself
+  - Reaktiv avoids wrapping values entirely and uses an arena allocator with a freelist for fast allocation/deallocation
+  - Less memory means better cache locality and speed, particularly when working with many small reactive values
 
-These are not fine-grained reactive systems in the same sense. They don't provide automatic dependency tracking with push-pull propagation. This crate implements true fine-grained reactivity with three-state (Clean/Check/Dirty) change propagation.
+* **More flexible intermediate computations**: In reactive_graph, intermediate computations are a special case. If an effect simply writes to another signal, that's not the same as a computed (and can lead to duplicate updates). Reaktiv doesn't have such a special case - a single effect can update multiple signals without adverse effects.
+
+* **Built to scale**: Reaktiv has the concept of skippable effects for handling large-scale UIs.
+  - These are dependent UI computations (like validation) that can be processed opportunistically
+  - If skippable effects exceed the frame time budget, reaktiv moves them to a background thread
+  - Only "must-run" effects execute on the main thread, keeping the UI snappy
+  - This is useful for UIs with large collections (thousands of elements) that update frequently
 
 ## Quick Start
 
 ```rust
-use reaktiv::{Signal, Effect, Computed, Transaction, flush_effects};
+use reaktiv::{Signal, Effect, Computed, Transaction, spawn_effect_loop};
 
 struct Component {
     value: f64,
@@ -79,6 +89,8 @@ impl Component {
     }
 }
 
+spawn_effect_loop();
+
 // Effects auto-track dependencies
 let effect = Effect::new(|| {
     component.signal.track_dependency();
@@ -90,26 +102,7 @@ Transaction::run(|| {
     component.set(1.0);
     component.set(2.0);
 });
-// Effect runs once, not twice
-
-flush_effects();
 ```
-
-## Core Concepts
-
-- **Signal** - Lightweight reactive marker (4 bytes). Call `emit()` when value changes.
-- **Effect** - Side-effectful computation. Auto-runs when dependencies change.
-- **Computed** - Memoized derived value. Recomputes only when inputs change.
-- **Transaction** - Batch multiple signal changes into one effect run.
-
-## Key Features
-
-- **Fine-grained tracking**: Automatic dependency detection
-- **Three-state propagation**: Clean/Check/Dirty minimizes unnecessary work
-- **Debounced execution**: Multiple invalidations batch into single run
-- **Hierarchical effects**: Parent effects clean up children automatically
-- **Origin tracking**: Distinguish API vs UI updates to prevent loops
-- **Explicit scheduling**: `flush_effects()` for predictable timing
 
 ## When to Use This
 
@@ -117,24 +110,15 @@ flush_effects();
 - FFI/Python bindings where intrusive design avoids wrapper overhead
 - Desktop applications with Qt/GTK event loops
 - Game engines needing predictable update timing
-- Any context where you want reactivity without framework lock-in
 
 ## When NOT to Use This
 
-- Building web applications (use Leptos or Dioxus instead)
-- Need signals that wrap and own values (`Signal<T>`)
+- Building web UIs (use more mature all-in-one options like Leptos or Dioxus instead)
+- Need signals that wrap and own values (`Signal<T>`). These can be built on top of reaktiv but that's not its aim
+- If you need a single-source of truth graph of signals like reactive-store provides for Leptos (again could be built on top but doesn't fit the core philosophy)
 
 ## Minimum Supported Rust Version (MSRV)
 
 The current MSRV is **1.85** (required for Rust 2024 edition).
 
 This crate tracks the Rust version available on the previous Ubuntu LTS release (currently Ubuntu 22.04). Since Canonical updates Firefox and its Rust toolchain for security reasons, the MSRV follows what's available through Ubuntu's package ecosystem. MSRV bumps that comply with this policy are not considered breaking changes.
-
-## License
-
-Licensed under either of:
-
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or <http://www.apache.org/licenses/LICENSE-2.0>)
-- MIT license ([LICENSE-MIT](LICENSE-MIT) or <http://opensource.org/licenses/MIT>)
-
-at your option.
