@@ -43,7 +43,7 @@ impl Signal {
     }
 
     /// Get the node ID for this signal (internal use only)
-    pub(crate) fn node_id(&self) -> SignalId {
+    pub(crate) fn id(&self) -> SignalId {
         self.node_id
     }
 
@@ -207,7 +207,7 @@ mod tests {
     #[test]
     fn signal_tracks_multiple_accesses_deduplicated() {
         let signal = Signal::new();
-        let signal_id = signal.node_id();
+        let signal_id = signal.id();
 
         // Create an effect that tracks the signal multiple times
         let effect = Effect::new(move || {

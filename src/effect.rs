@@ -536,7 +536,7 @@ mod tests {
         use std::sync::atomic::AtomicI32;
 
         let signal = crate::Signal::new();
-        let signal_node_id = signal.node_id();
+        let signal_node_id = signal.id();
         let counter = Arc::new(AtomicI32::new(0));
 
         let counter_clone = counter.clone();
@@ -593,7 +593,7 @@ mod tests {
         use std::sync::atomic::AtomicI32;
 
         let signal = crate::Signal::new();
-        let signal_node_id = signal.node_id();
+        let signal_node_id = signal.id();
         let counter = Arc::new(AtomicI32::new(0));
 
         let counter_clone = counter.clone();
@@ -631,7 +631,7 @@ mod tests {
         use std::sync::atomic::AtomicI32;
 
         let signal = crate::Signal::new();
-        let signal_node_id = signal.node_id();
+        let signal_node_id = signal.id();
         let counter = Arc::new(AtomicI32::new(0));
 
         let counter_clone = counter.clone();
@@ -660,7 +660,7 @@ mod tests {
         use std::sync::atomic::AtomicI32;
 
         let signal = crate::Signal::new();
-        let signal_node_id = signal.node_id();
+        let signal_node_id = signal.id();
         let counter = Arc::new(AtomicI32::new(0));
 
         let counter_clone = counter.clone();
@@ -690,7 +690,7 @@ mod tests {
         // Verify flush_effects processes pending effects
         use std::sync::atomic::AtomicI32;
         let signal = crate::Signal::new();
-        let signal_node_id = signal.node_id();
+        let signal_node_id = signal.id();
         let counter = Arc::new(AtomicI32::new(0));
 
         let counter_clone = counter.clone();

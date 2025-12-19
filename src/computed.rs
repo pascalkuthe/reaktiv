@@ -1,6 +1,6 @@
 use crate::arena::{
-    EffectMetadata, SignalId, SignalMetadata, current_effect, effect_arena_insert,
-    set_effect_parent, signal_arena_insert,
+    EffectMetadata, SignalMetadata, current_effect, effect_arena_insert, set_effect_parent,
+    signal_arena_insert,
 };
 use crate::{Effect, Signal};
 use parking_lot::{Mutex, RwLock};
@@ -218,7 +218,7 @@ impl<T: Clone + PartialEq + Send + Sync + 'static> Computed<T> {
     /// Then this method will recompute the value before returning it.
     pub fn get(&self) -> T {
         let effect_id = self.effect.id();
-        let signal_id = self.signal.node_id();
+        let signal_id = self.signal.id();
 
         // Recompute if stale and not already being tracked by current effect
         let should_recompute = effect_id.needs_work() && {
@@ -258,16 +258,6 @@ impl<T: Clone + PartialEq + Send + Sync + 'static> Computed<T> {
     pub fn invalidate(&self) {
         // Mark the effect as pending so it will re-run
         crate::arena::mark_effect_pending(self.effect.id());
-    }
-
-    /// Get the SignalId for this computed value (internal use only)
-    pub(crate) fn signal_id(&self) -> SignalId {
-        self.signal.node_id()
-    }
-
-    /// Get the EffectId for this computed value (internal use only)
-    pub(crate) fn effect_id(&self) -> crate::arena::EffectId {
-        self.effect.id()
     }
 }
 
@@ -338,7 +328,7 @@ mod tests {
         // Create an effect that depends on the computed
         let effect_run_count = std::sync::Arc::new(std::sync::atomic::AtomicI32::new(0));
         let effect_run_count_clone = effect_run_count.clone();
-        let computed_signal_id = computed.signal_id();
+        let computed_signal_id = computed.signal.id();
         let _effect = crate::Effect::new(move || {
             computed_signal_id.track_dependency();
             effect_run_count_clone.fetch_add(1, Ordering::Relaxed);
@@ -379,7 +369,7 @@ mod tests {
         // Create an effect that depends on the computed
         let effect_run_count = std::sync::Arc::new(std::sync::atomic::AtomicI32::new(0));
         let effect_run_count_clone = effect_run_count.clone();
-        let computed_signal_id = computed.signal_id();
+        let computed_signal_id = computed.signal.id();
         let _effect = crate::Effect::new(move || {
             computed_signal_id.track_dependency();
             effect_run_count_clone.fetch_add(1, Ordering::Relaxed);
@@ -481,7 +471,7 @@ mod tests {
         use crate::Signal;
 
         let signal = Signal::new();
-        let signal_id = signal.node_id();
+        let signal_id = signal.id();
         let call_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let call_count_clone = call_count.clone();
 
@@ -586,5 +576,24 @@ mod tests {
         let v4 = computed.get();
         assert_eq!(v4, 20);
         assert_eq!(call_count.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn skippable_computed_flag_set_correctly() {
+        // Test that Computed::new_skippable() sets the skippable flag
+        let computed = Computed::new_skippable(|| 42);
+        assert!(computed.effect.id().is_skippable());
+
+        // Test that regular Computed::new() creates non-skippable computeds
+        let regular_computed = Computed::new(|| 42);
+        assert!(!regular_computed.effect.id().is_skippable());
+
+        // Test lazy_skippable
+        let lazy_skippable = Computed::lazy_skippable(|| 42);
+        assert!(lazy_skippable.effect.id().is_skippable());
+
+        // Test regular lazy
+        let lazy_regular = Computed::lazy(|| 42);
+        assert!(!lazy_regular.effect.id().is_skippable());
     }
 }

@@ -90,7 +90,7 @@ fn transaction_suppresses_ui_updates() {
     let run_count = Arc::new(AtomicUsize::new(0));
 
     let run_count_clone = run_count.clone();
-    let signal_id = circuit.voltage_signal.node_id();
+    let signal_id = circuit.voltage_signal.id();
     let _effect = Effect::new(move || {
         signal_id.track_dependency();
         run_count_clone.fetch_add(1, Ordering::Relaxed);
@@ -115,7 +115,7 @@ fn debouncing_batches_rapid_emissions() {
     let effect_runs_clone = effect_runs.clone();
 
     let circuit = Arc::new(TestCircuit::new());
-    let voltage_signal_id = circuit.voltage_signal.node_id();
+    let voltage_signal_id = circuit.voltage_signal.id();
 
     let effect = Effect::new(move || {
         // Track dependency using CURRENT_EFFECT mechanism
@@ -195,7 +195,7 @@ fn transaction_nesting_preserves_state() {
 #[test]
 fn computed_recomputes_on_dependency_change() {
     let circuit = Arc::new(TestCircuit::new());
-    let voltage_signal_id = circuit.voltage_signal.node_id();
+    let voltage_signal_id = circuit.voltage_signal.id();
 
     let computation_count = Arc::new(AtomicUsize::new(0));
     let cc_clone = computation_count.clone();
@@ -230,7 +230,7 @@ fn signal_emit_in_transaction_defers_effect() {
     use std::sync::atomic::AtomicI32;
 
     let signal = Signal::new();
-    let signal_id = signal.node_id();
+    let signal_id = signal.id();
     let counter = Arc::new(AtomicI32::new(0));
     let counter_clone = counter.clone();
 
@@ -264,8 +264,8 @@ fn transaction_batches_multiple_emissions() {
 
     let signal1 = Signal::new();
     let signal2 = Signal::new();
-    let signal1_id = signal1.node_id();
-    let signal2_id = signal2.node_id();
+    let signal1_id = signal1.id();
+    let signal2_id = signal2.id();
 
     let run_count = Arc::new(AtomicI32::new(0));
     let run_count_clone = run_count.clone();
@@ -300,7 +300,7 @@ fn nested_transactions_defer_until_outermost_exits() {
     use std::sync::atomic::AtomicI32;
 
     let signal = Signal::new();
-    let signal_id = signal.node_id();
+    let signal_id = signal.id();
     let run_count = Arc::new(AtomicI32::new(0));
     let run_count_clone = run_count.clone();
 
@@ -388,7 +388,7 @@ fn children_destroyed_when_parent_reruns() {
     use std::sync::atomic::AtomicI32;
 
     let signal = Signal::new();
-    let signal_id = signal.node_id();
+    let signal_id = signal.id();
 
     let parent_runs = Arc::new(AtomicI32::new(0));
     let child_creates = Arc::new(AtomicI32::new(0));
@@ -469,7 +469,7 @@ fn signal_emit_schedules_processing_when_not_in_transaction() {
     use std::sync::atomic::AtomicI32;
 
     let signal = Signal::new();
-    let signal_id = signal.node_id();
+    let signal_id = signal.id();
     let run_count = Arc::new(AtomicI32::new(0));
     let run_count_clone = run_count.clone();
 
@@ -545,7 +545,7 @@ fn children_destroyed_immediately_on_parent_invalidation() {
     use std::sync::atomic::AtomicI32;
 
     let signal = Signal::new();
-    let signal_id = signal.node_id();
+    let signal_id = signal.id();
 
     let parent_runs = Arc::new(AtomicI32::new(0));
     let child_created = Arc::new(AtomicI32::new(0));
@@ -610,7 +610,7 @@ fn debouncing_batches_rapid_signal_changes() {
     use std::sync::atomic::AtomicI32;
 
     let signal = Signal::new();
-    let signal_id = signal.node_id();
+    let signal_id = signal.id();
     let run_count = Arc::new(AtomicI32::new(0));
 
     let rc = run_count.clone();
@@ -650,7 +650,7 @@ fn complex_chain_propagates_correctly() {
     use std::sync::atomic::AtomicI32;
 
     let signal = Signal::new();
-    let signal_id = signal.node_id();
+    let signal_id = signal.id();
 
     let computed1_count = Arc::new(AtomicI32::new(0));
     let cc1 = computed1_count.clone();
@@ -700,7 +700,7 @@ fn diamond_dependency_updates_correctly() {
     use std::sync::atomic::AtomicI32;
 
     let signal = Signal::new();
-    let signal_id = signal.node_id();
+    let signal_id = signal.id();
 
     let counter = Arc::new(AtomicI32::new(0));
 
@@ -739,8 +739,8 @@ fn effect_resubscribes_on_each_run() {
 
     let signal_a = Signal::new();
     let signal_b = Signal::new();
-    let signal_a_id = signal_a.node_id();
-    let signal_b_id = signal_b.node_id();
+    let signal_a_id = signal_a.id();
+    let signal_b_id = signal_b.id();
 
     let use_b = Arc::new(AtomicBool::new(false));
     let counter = Arc::new(AtomicI32::new(0));
@@ -801,7 +801,7 @@ fn stress_test_many_signals() {
     use std::sync::atomic::AtomicI32;
 
     let signals: Vec<Signal> = (0..100).map(|_| Signal::new()).collect();
-    let signal_ids: Vec<_> = signals.iter().map(super::signal::Signal::node_id).collect();
+    let signal_ids: Vec<_> = signals.iter().map(super::signal::Signal::id).collect();
     let counter = Arc::new(AtomicI32::new(0));
 
     let counter_clone = counter.clone();
@@ -831,7 +831,7 @@ fn stress_test_many_effects() {
     use std::sync::atomic::AtomicI32;
 
     let signal = Signal::new();
-    let signal_id = signal.node_id();
+    let signal_id = signal.id();
     let counter = Arc::new(AtomicI32::new(0));
 
     let _effects: Vec<Effect> = (0..100)
@@ -861,7 +861,7 @@ fn rapid_emissions_debounced() {
     use std::sync::atomic::AtomicI32;
 
     let signal = Signal::new();
-    let signal_id = signal.node_id();
+    let signal_id = signal.id();
     let counter = Arc::new(AtomicI32::new(0));
 
     let counter_clone = counter.clone();
@@ -895,7 +895,7 @@ fn deeply_nested_hierarchy_stress() {
     use std::sync::atomic::AtomicI32;
 
     let signal = Signal::new();
-    let signal_id = signal.node_id();
+    let signal_id = signal.id();
 
     let levels_created = Arc::new(AtomicI32::new(0));
 
@@ -954,7 +954,7 @@ fn signal_drop_cleanup_is_safe() {
     let counter_clone = counter.clone();
 
     let signal = Signal::new();
-    let signal_id = signal.node_id();
+    let signal_id = signal.id();
 
     let effect = Effect::new(move || {
         signal_id.track_dependency();
@@ -982,7 +982,7 @@ fn signal_drop_with_pending_effect_cleans_up() {
     let counter_clone = counter.clone();
 
     let signal = Signal::new();
-    let signal_id = signal.node_id();
+    let signal_id = signal.id();
 
     let _effect = Effect::new(move || {
         signal_id.track_dependency();
@@ -1017,7 +1017,7 @@ fn effect_drop_cleanup_is_safe() {
     use std::sync::atomic::AtomicI32;
 
     let signal = Signal::new();
-    let signal_id = signal.node_id();
+    let signal_id = signal.id();
     let counter = Arc::new(AtomicI32::new(0));
 
     // Create a scope to control effect lifetime
@@ -1048,7 +1048,7 @@ fn effect_drop_while_pending_does_not_run() {
     let counter_clone = counter.clone();
 
     let signal = Signal::new();
-    let signal_id = signal.node_id();
+    let signal_id = signal.id();
 
     let effect = Effect::new(move || {
         signal_id.track_dependency();
@@ -1086,7 +1086,7 @@ fn stale_signal_id_returns_none() {
     // 2. After drop, accessing the ID doesn't panic (the main safety goal)
 
     let signal = Signal::new();
-    let signal_id = signal.node_id();
+    let signal_id = signal.id();
 
     // Verify it works while signal exists
     assert!(signal_id.with_subscribers(|_| ()).is_some());
@@ -1138,7 +1138,7 @@ fn ui_origin_filtering_with_track_ui_only() {
     use std::sync::atomic::AtomicI32;
 
     let signal = Signal::new();
-    let signal_id = signal.node_id();
+    let signal_id = signal.id();
     let counter = Arc::new(AtomicI32::new(0));
 
     // Create an effect with ui_updates_only=true that tracks the signal
@@ -1180,7 +1180,7 @@ fn ui_origin_filtering_behavior() {
     use std::sync::atomic::AtomicI32;
 
     let signal = Signal::new();
-    let signal_id = signal.node_id();
+    let signal_id = signal.id();
 
     // Counter for effect that only wants data updates (ui_updates_only=true)
     let data_only_counter = Arc::new(AtomicI32::new(0));
@@ -1345,7 +1345,7 @@ fn effect_creates_sibling_effects() {
     use std::sync::atomic::AtomicI32;
 
     let signal = Signal::new();
-    let signal_id = signal.node_id();
+    let signal_id = signal.id();
 
     let child_count = Arc::new(AtomicI32::new(0));
 
@@ -1406,7 +1406,7 @@ fn effect_writing_tracked_as_output() {
 
     let input_signal = Signal::new();
     let output_signal = Signal::new();
-    let input_signal_id = input_signal.node_id();
+    let input_signal_id = input_signal.id();
 
     let counter = Arc::new(AtomicI32::new(0));
     let counter_clone = counter.clone();
@@ -1438,8 +1438,8 @@ fn effect_emit_tracked_as_output() {
 
     let input_signal = Signal::new();
     let output_signal = Signal::new();
-    let input_signal_id = input_signal.node_id();
-    let output_signal_id = output_signal.node_id();
+    let input_signal_id = input_signal.id();
+    let output_signal_id = output_signal.id();
 
     // Create an effect that reads input and emits to output
     let effect = Effect::new(move || {
@@ -1486,7 +1486,7 @@ fn untracked_prevents_dependency() {
     use crate::untracked;
 
     let signal = Signal::new();
-    let signal_id = signal.node_id();
+    let signal_id = signal.id();
 
     // Create an effect that uses untracked
     let effect = Effect::new(move || {
@@ -1537,7 +1537,7 @@ fn effect_rerun_clears_outputs() {
     let input_signal = Signal::new();
     let _output_signal_a = Signal::new();
     let _output_signal_b = Signal::new();
-    let input_signal_id = input_signal.node_id();
+    let input_signal_id = input_signal.id();
 
     let use_b = Arc::new(AtomicBool::new(false));
     let use_b_clone = use_b.clone();
@@ -1570,7 +1570,7 @@ fn pull_ensures_fresh_values() {
     // This test verifies the pull mechanism works
 
     let signal = Signal::new();
-    let signal_id = signal.node_id();
+    let signal_id = signal.id();
 
     // Pull on a signal with no writers should be a no-op
     signal_id.pull(false);
@@ -1590,7 +1590,7 @@ fn diamond_with_pull_gets_fresh_values() {
     use std::sync::atomic::AtomicI32;
 
     let input_signal = Signal::new();
-    let input_signal_id = input_signal.node_id();
+    let input_signal_id = input_signal.id();
 
     let effect1_runs = Arc::new(AtomicI32::new(0));
     let effect2_runs = Arc::new(AtomicI32::new(0));
@@ -1629,7 +1629,7 @@ fn fixed_point_iteration_processes_cascades() {
     let counter = Arc::new(AtomicI32::new(0));
 
     let signal = Signal::new();
-    let signal_id = signal.node_id();
+    let signal_id = signal.id();
 
     let counter_clone = counter.clone();
 
@@ -1670,7 +1670,7 @@ fn read_write_cycle_detection() {
     use std::sync::atomic::AtomicI32;
 
     let signal = Signal::new();
-    let signal_id = signal.node_id();
+    let signal_id = signal.id();
     let run_count = Arc::new(AtomicI32::new(0));
     let run_count_clone = run_count.clone();
 
@@ -1702,7 +1702,7 @@ fn read_write_different_signals_allowed() {
 
     let signal_read = Signal::new();
     let signal_write = Signal::new();
-    let signal_read_id = signal_read.node_id();
+    let signal_read_id = signal_read.id();
     let run_count = Arc::new(AtomicI32::new(0));
     let run_count_clone = run_count.clone();
 
@@ -1742,25 +1742,6 @@ fn skippable_effect_flag_set_correctly() {
     // Test that regular Effect::new() creates non-skippable effects
     let regular_effect = Effect::new(|| {});
     assert!(!regular_effect.id().is_skippable());
-}
-
-#[test]
-fn skippable_computed_flag_set_correctly() {
-    // Test that Computed::new_skippable() sets the skippable flag
-    let computed = Computed::new_skippable(|| 42);
-    assert!(computed.effect_id().is_skippable());
-
-    // Test that regular Computed::new() creates non-skippable computeds
-    let regular_computed = Computed::new(|| 42);
-    assert!(!regular_computed.effect_id().is_skippable());
-
-    // Test lazy_skippable
-    let lazy_skippable = Computed::lazy_skippable(|| 42);
-    assert!(lazy_skippable.effect_id().is_skippable());
-
-    // Test regular lazy
-    let lazy_regular = Computed::lazy(|| 42);
-    assert!(!lazy_regular.effect_id().is_skippable());
 }
 
 #[test]
@@ -1811,7 +1792,7 @@ fn pull_skips_skippable_when_flag_set() {
     use std::sync::atomic::AtomicI32;
 
     let signal = Signal::new();
-    let signal_id = signal.node_id();
+    let signal_id = signal.id();
 
     // Create a skippable computed that writes to the signal
     let skippable_count = Arc::new(AtomicI32::new(0));
@@ -1913,8 +1894,8 @@ fn check_state_effects_added_to_pending() {
     let output = Signal::new();
 
     // Get IDs for use in closures
-    let trigger_id = trigger.node_id();
-    let output_id = output.node_id();
+    let trigger_id = trigger.id();
+    let output_id = output.id();
 
     // Effect A: reads trigger, writes to output
     // We manually do what Signal::emit() does: register output and notify
@@ -1971,9 +1952,9 @@ fn check_state_propagation_through_chain() {
     let end = Signal::new();
 
     // Get IDs for use in closures
-    let source_id = source.node_id();
-    let middle_id = middle.node_id();
-    let end_id = end.node_id();
+    let source_id = source.id();
+    let middle_id = middle.id();
+    let end_id = end.id();
 
     // Effect chain: source -> middle -> end
     // We manually do what Signal::emit() does: register output and notify
