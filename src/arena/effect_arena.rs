@@ -4,7 +4,7 @@
 // computeds, and provides helper functions for working with the effect arena.
 //
 // The EffectMetadata struct contains:
-// - sources: the signals this effect/computed depends on (stored as IndexSet)
+// - sources: the signals this effect/computed depends on (stored as HashSet)
 // - state: a three-state reactive state (Clean/Check/Dirty) for Leptos-style propagation
 // - callback: the effect function stored directly in the arena (for effects)
 //
@@ -18,9 +18,11 @@
 
 use crate::hash::FastHashBuilder;
 use indexmap::IndexSet;
+use papaya::HashMap as PapayaHashMap;
 use parking_lot::{Mutex, RwLock};
 use slab::Slab;
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -57,6 +59,57 @@ impl ReactiveState {
 
 use super::SignalId;
 
+/// Tracks whether a signal is a source (read) and/or output (written) for this effect
+#[derive(Clone, Copy, Default)]
+pub(crate) struct SignalRelation {
+    pub(crate) is_source: bool,
+    pub(crate) is_output: bool,
+}
+
+/// Iterator over source SignalIds for an effect
+pub struct SourcesIter<'a> {
+    inner: std::iter::FilterMap<
+        std::collections::hash_map::Iter<'a, SignalId, SignalRelation>,
+        fn((&'a SignalId, &'a SignalRelation)) -> Option<SignalId>,
+    >,
+}
+
+impl Iterator for SourcesIter<'_> {
+    type Item = SignalId;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next()
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+/// Iterator over output SignalIds for an effect
+pub struct OutputsIter<'a> {
+    inner: std::iter::FilterMap<
+        std::collections::hash_map::Iter<'a, SignalId, SignalRelation>,
+        fn((&'a SignalId, &'a SignalRelation)) -> Option<SignalId>,
+    >,
+}
+
+impl Iterator for OutputsIter<'_> {
+    type Item = SignalId;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next()
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
 /// Global effect arena - stores all effect and computed metadata
 static EFFECT_ARENA: RwLock<Slab<EffectMetadata>> = RwLock::new(Slab::new());
 
@@ -65,6 +118,19 @@ static EFFECT_ARENA: RwLock<Slab<EffectMetadata>> = RwLock::new(Slab::new());
 // Uses RwLock for thread-safe access since EFFECT_ARENA is also global.
 static PENDING_EFFECTS: LazyLock<RwLock<IndexSet<EffectId, FastHashBuilder>>> =
     LazyLock::new(|| RwLock::new(IndexSet::default()));
+
+// Global map: EffectId -> parent EffectId
+// Stores parent-child relationships for effect hierarchy.
+// Uses papaya's lock-free HashMap for efficient concurrent reads.
+static EFFECT_PARENT: LazyLock<PapayaHashMap<EffectId, EffectId>> =
+    LazyLock::new(PapayaHashMap::new);
+
+// Global map: EffectId -> children Vec<EffectId>
+// Stores child effects for each parent effect.
+// Uses papaya's lock-free HashMap for efficient concurrent reads.
+// The Vec is wrapped in RwLock for safe mutation.
+static EFFECT_CHILDREN: LazyLock<PapayaHashMap<EffectId, RwLock<Vec<EffectId>>>> =
+    LazyLock::new(PapayaHashMap::new);
 
 // Thread-local current effect being executed.
 // Used to establish parent/child relationships when effects create other effects.
@@ -134,12 +200,15 @@ impl EffectId {
         arena.get(self.index()).map(f)
     }
 
-    /// Get the sources of this effect
-    pub fn sources(self) -> Option<Vec<SignalId>> {
-        self.with(EffectMetadata::get_sources)
+    /// Execute a closure with an iterator over sources
+    pub fn with_sources<F, R>(self, f: F) -> Option<R>
+    where
+        F: FnOnce(SourcesIter<'_>) -> R,
+    {
+        self.with(|metadata| metadata.with_sources(f))
     }
 
-    /// Add a source to this effect's dependency list (no duplicates via IndexSet)
+    /// Add a source to this effect's dependency list (no duplicates via HashSet)
     pub fn add_source(self, source: SignalId) -> Option<()> {
         self.with(|metadata| {
             metadata.add_source(source);
@@ -160,6 +229,15 @@ impl EffectId {
         self.with(|metadata| {
             metadata.remove_source(source);
         })
+    }
+
+    /// Check if a signal is a source (dependency) of this effect
+    ///
+    /// O(1) lookup using the underlying HashMap. Returns false if the effect
+    /// has been removed (stale access).
+    pub fn has_source(self, signal_id: SignalId) -> bool {
+        self.with(|metadata| metadata.has_source(signal_id))
+            .unwrap_or(false)
     }
 
     // =========================================================================
@@ -256,75 +334,95 @@ impl EffectId {
         self.with(EffectMetadata::has_callback).unwrap_or(false)
     }
 
-    /// Get the parent effect ID
+    /// Get the parent effect ID from the global EFFECT_PARENT map
     pub fn parent(self) -> Option<EffectId> {
-        self.with(EffectMetadata::get_parent).flatten()
+        let guard = EFFECT_PARENT.pin();
+        guard.get(&self).copied()
     }
 
-    /// Get all child effect IDs
-    pub fn children(self) -> Option<Vec<EffectId>> {
-        self.with(EffectMetadata::get_children)
-    }
-
-    /// Add a child to this effect
-    pub fn add_child(self, child: EffectId) {
-        self.with(|metadata| metadata.add_child(child));
-    }
-
-    /// Remove a child from this effect
-    pub fn remove_child(self, child: EffectId) {
-        self.with(|metadata| metadata.remove_child(child));
-    }
-
-    /// Clear all children (does not destroy them)
-    pub fn clear_children(self) {
-        self.with(EffectMetadata::clear_children);
-    }
-
-    /// Check if this effect is local (must run on main thread)
+    /// Execute a closure with the children of this effect
     ///
-    /// Local effects are used for Python callbacks that need the GIL.
-    /// Returns true if the effect is local, or true (conservative default) if effect doesn't exist.
-    pub fn is_local(self) -> bool {
-        self.with(EffectMetadata::is_local).unwrap_or(true)
+    /// This avoids allocation by passing a reference to the Vec directly.
+    /// Returns None if this effect has no children registered.
+    pub fn with_children<F, R>(self, f: F) -> Option<R>
+    where
+        F: FnOnce(&Vec<EffectId>) -> R,
+    {
+        let guard = EFFECT_CHILDREN.pin();
+        guard.get(&self).map(|children| {
+            let read_guard = children.read();
+            f(&read_guard)
+        })
+    }
+
+    /// Add a child to this effect in the global EFFECT_CHILDREN map
+    pub fn add_child(self, child: EffectId) {
+        let guard = EFFECT_CHILDREN.pin();
+        guard
+            .get_or_insert_with(self, || RwLock::new(Vec::new()))
+            .write()
+            .push(child);
+    }
+
+    /// Remove a child from this effect in the global EFFECT_CHILDREN map
+    pub fn remove_child(self, child: EffectId) {
+        let guard = EFFECT_CHILDREN.pin();
+        if let Some(children) = guard.get(&self) {
+            children.write().retain(|c| *c != child);
+        }
+    }
+
+    /// Clear all children (does not destroy them) from the global EFFECT_CHILDREN map
+    pub fn clear_children(self) {
+        let guard = EFFECT_CHILDREN.pin();
+        if let Some(children) = guard.get(&self) {
+            children.write().clear();
+        }
     }
 
     // =========================================================================
     // Output tracking methods (for push-pull system)
     // =========================================================================
 
-    /// Get the signals this effect writes to (outputs)
-    ///
-    /// Returns None if the effect has been removed (stale access).
-    pub fn outputs(self) -> Option<Vec<SignalId>> {
-        self.with(EffectMetadata::get_outputs)
+    /// Execute a closure with an iterator over outputs
+    pub fn with_outputs<F, R>(self, f: F) -> Option<R>
+    where
+        F: FnOnce(OutputsIter<'_>) -> R,
+    {
+        self.with(|metadata| metadata.with_outputs(f))
     }
 
     /// Add a signal to this effect's output list
     ///
     /// Called when an effect writes to a signal via emit().
-    /// Uses IndexSet so duplicates are automatically ignored.
+    /// Uses HashSet so duplicates are automatically ignored.
     pub fn add_output(self, signal_id: SignalId) -> Option<()> {
         self.with(|metadata| {
             metadata.add_output(signal_id);
         })
     }
 
-    /// Clear all outputs of this effect
+    /// Clear all sources and outputs, calling callbacks for each
     ///
-    /// Called before re-running an effect to clear old output tracking.
-    pub fn clear_outputs(self) -> Option<()> {
-        self.with(|metadata| {
-            metadata.clear_outputs();
-        })
+    /// Used when an effect re-runs to unsubscribe from old sources
+    /// and unregister from old outputs in a single pass.
+    pub fn clear_signals<F1, F2>(self, on_source: F1, on_output: F2)
+    where
+        F1: FnMut(SignalId),
+        F2: FnMut(SignalId),
+    {
+        self.with(|metadata| metadata.clear_signals(on_source, on_output));
     }
 
-    /// Take all outputs from this effect (returns them and clears the list)
-    ///
-    /// This is useful for atomically getting and clearing the outputs,
-    /// typically done before re-running an effect.
-    pub fn take_outputs(self) -> Option<Vec<SignalId>> {
-        self.with(EffectMetadata::take_outputs)
+    /// Check if this effect is skippable (can be deferred under load)
+    pub fn is_skippable(self) -> bool {
+        self.with(EffectMetadata::is_skippable).unwrap_or(false)
+    }
+
+    /// Check if this effect only wants UI updates (skips internal state updates)
+    pub fn is_ui_updates_only(self) -> bool {
+        self.with(EffectMetadata::is_ui_updates_only)
+            .unwrap_or(false)
     }
 
     // =========================================================================
@@ -351,11 +449,11 @@ impl EffectId {
             mark_effect_pending_for_check(self);
 
             // Recursively mark dependents of signals this effect writes
-            if let Some(outputs) = self.outputs() {
+            self.with_outputs(|outputs| {
                 for output_signal in outputs {
                     output_signal.mark_subscribers_check();
                 }
-            }
+            });
         }
         // If already Check or Dirty, no need to propagate further
     }
@@ -371,16 +469,22 @@ impl EffectId {
     ///
     /// This is the "pull" verification for the three-state system.
     /// Returns true if the effect actually ran (value may have changed).
-    pub fn update_if_necessary(self) -> bool {
+    ///
+    /// # Skippable Effects
+    /// If `skip_skippable` is true, skippable effects are skipped when pulling sources.
+    /// This allows consumers to avoid running producer effects when over budget.
+    pub fn update_if_necessary(self, skip_skippable: bool) -> bool {
         match self.state() {
             ReactiveState::Clean => false,
 
             ReactiveState::Check => {
                 // Verify by pulling parents (sources)
-                if let Some(sources) = self.sources() {
+                // Each effect has its own signals RwLock, so no deadlock concern
+                self.with_sources(|sources| {
                     for source_id in sources {
                         // Pull the source (might run writer effects)
-                        source_id.pull();
+                        // Pass skip_skippable through to avoid running skippable producers
+                        source_id.pull(skip_skippable);
 
                         // If pulling made us Dirty, stop checking
                         if self.state() == ReactiveState::Dirty {
@@ -388,7 +492,7 @@ impl EffectId {
                             break;
                         }
                     }
-                }
+                });
 
                 // If still Check after verifying all parents, we're Clean
                 if self.state() == ReactiveState::Check {
@@ -419,18 +523,18 @@ impl EffectId {
         // Mark direct children of our outputs as Dirty (value changed)
         // Note: run_single_effect clears and re-establishes outputs, so
         // we need to get the new outputs after running
-        if let Some(outputs) = self.outputs() {
+        self.with_outputs(|outputs| {
             for output in outputs {
-                if let Some(subs) = output.subscribers() {
-                    for sub in subs {
-                        if sub.effect_id.state() == ReactiveState::Check {
+                output.with_subscribers(|subs| {
+                    for effect_id in subs {
+                        if effect_id.state() == ReactiveState::Check {
                             cov_mark::hit!(child_upgraded_check_to_dirty);
                         }
-                        sub.effect_id.upgrade_state(ReactiveState::Dirty);
+                        effect_id.upgrade_state(ReactiveState::Dirty);
                     }
-                }
+                });
             }
-        }
+        });
 
         true
     }
@@ -440,57 +544,47 @@ impl EffectId {
 ///
 /// This struct replaces the previous enum (EffectMetadata::Effect/Computed) since
 /// both types have similar structure:
-/// - sources: signals this node depends on (inputs)
-/// - outputs: signals this effect writes to (push-pull system)
+/// - signals: signals related to this effect (both sources and outputs)
 /// - state: three-state reactive state (Clean/Check/Dirty) for Leptos-style propagation
 /// - callback: optional effect function (only for effects, not computeds)
-/// - parent/children: hierarchy for proper cleanup when parent re-runs
-/// - local: whether this effect must run on the main thread (for Python/GIL)
+/// - flags: bitset for local/skippable flags
+///
+/// Parent/child relationships are stored in separate global maps (EFFECT_PARENT/EFFECT_CHILDREN)
+/// to keep EffectMetadata smaller and improve cache locality.
 ///
 /// Using a single struct reduces code duplication and simplifies the API.
-/// The sources and outputs fields use IndexSet for O(1) lookup and automatic deduplication.
+/// The signals field uses HashMap to track both sources (reads) and outputs (writes),
+/// reducing memory overhead when a signal is both read and written.
 ///
 /// The callback is stored directly in the arena, making Effect a thin wrapper
 /// around EffectId. This eliminates the need for external registries like
 /// EFFECT_REGISTRY.
 pub struct EffectMetadata {
-    /// Child effects created during this effect's callback execution.
-    /// When this effect re-runs, all children are destroyed first.
-    pub(crate) children: RwLock<Vec<EffectId>>,
-
-    /// Signals this effect/computed depends on (inputs).
-    /// When any of these change, the node is invalidated.
-    /// Uses IndexSet for O(1) lookup and automatic deduplication.
-    /// FastHashBuilder provides zero-sized hasher for memory efficiency.
-    pub(crate) sources: RwLock<IndexSet<SignalId, FastHashBuilder>>,
-
-    /// Signals this effect writes to (outputs for push-pull system).
-    /// When this effect runs and calls emit() on a signal, that signal
-    /// is tracked as an output. This allows pull() to know which effects
-    /// produce values for which signals.
-    pub(crate) outputs: RwLock<IndexSet<SignalId, FastHashBuilder>>,
-
-    /// The effect callback function (None for computeds, Some for effects).
-    /// Using Mutex for thread-safety with dyn FnMut.
-    /// The callback must be Send to be stored in a global static.
-    pub(crate) callback: Mutex<Option<Box<dyn FnMut() + Send>>>,
-
-    /// Parent effect (if this effect was created inside another effect's callback)
-    /// When the parent re-runs, this child effect will be destroyed.
-    pub(crate) parent: Option<EffectId>,
-
     /// Three-state reactive state for Leptos-style propagation:
     /// - Clean (0): Value is current, use cached
     /// - Check (1): Might be stale, verify parents first
     /// - Dirty (2): Definitely stale, must recompute
     pub(crate) state: AtomicU8,
 
-    /// Whether this effect must run on the main thread (local effects).
-    /// Local effects are used for Python callbacks that need the GIL.
-    /// When true, this effect runs sequentially on the current thread.
-    /// When false (default), this effect can run in parallel with others.
-    pub(crate) local: bool,
+    /// Flags bitset:
+    /// - bit 0: skippable (can be deferred under load)
+    /// Note: The 'local' flag (for Python/GIL) is mentioned in comments but not currently used
+    pub(crate) flags: u8,
+
+    /// The effect callback function (None for computeds, Some for effects).
+    /// Using Mutex for thread-safety with dyn FnMut.
+    /// The callback must be Send to be stored in a global static.
+    pub(crate) callback: Mutex<Option<Box<dyn FnMut() + Send>>>,
+
+    /// Signals related to this effect - maps SignalId to whether it's a source/output.
+    /// This unified approach reduces memory overhead when signals are both read and written.
+    /// FastHashBuilder provides zero-sized hasher for memory efficiency.
+    pub(crate) signals: RwLock<HashMap<SignalId, SignalRelation, FastHashBuilder>>,
 }
+
+// Flag bit positions
+const FLAG_SKIPPABLE: u8 = 1 << 0;
+const FLAG_UI_UPDATES_ONLY: u8 = 1 << 1;
 
 impl EffectMetadata {
     /// Create new effect metadata with default values (state = Clean, no callback)
@@ -499,13 +593,10 @@ impl EffectMetadata {
     /// (Computed keeps its own function since it returns a value)
     pub fn new() -> Self {
         Self {
-            sources: RwLock::new(IndexSet::default()),
-            outputs: RwLock::new(IndexSet::default()),
             state: AtomicU8::new(ReactiveState::Clean as u8),
+            flags: 0,
             callback: Mutex::new(None),
-            parent: None,
-            children: RwLock::new(Vec::new()),
-            local: false,
+            signals: RwLock::new(HashMap::with_hasher(FastHashBuilder)),
         }
     }
 
@@ -514,51 +605,27 @@ impl EffectMetadata {
     /// Use this for Effects which store their callback directly in the arena.
     pub fn new_with_callback(callback: Box<dyn FnMut() + Send>) -> Self {
         Self {
-            sources: RwLock::new(IndexSet::default()),
-            outputs: RwLock::new(IndexSet::default()),
             state: AtomicU8::new(ReactiveState::Clean as u8),
+            flags: 0,
             callback: Mutex::new(Some(callback)),
-            parent: None,
-            children: RwLock::new(Vec::new()),
-            local: false,
+            signals: RwLock::new(HashMap::with_hasher(FastHashBuilder)),
         }
     }
 
     /// Create new effect metadata with a parent (for hierarchical effects)
     ///
     /// Use this for Effects created inside another effect's callback.
+    /// Parent is stored in the global EFFECT_PARENT map, not in the metadata.
     pub fn new_with_callback_and_parent(
         callback: Box<dyn FnMut() + Send>,
-        parent: Option<EffectId>,
+        _parent: Option<EffectId>,
     ) -> Self {
+        // Parent is stored in EFFECT_PARENT map, not in metadata
         Self {
-            sources: RwLock::new(IndexSet::default()),
-            outputs: RwLock::new(IndexSet::default()),
             state: AtomicU8::new(ReactiveState::Clean as u8),
+            flags: 0,
             callback: Mutex::new(Some(callback)),
-            parent,
-            children: RwLock::new(Vec::new()),
-            local: false,
-        }
-    }
-
-    /// Create new effect metadata with a parent and local flag (for hierarchical effects)
-    ///
-    /// Use this for Effects created inside another effect's callback that need
-    /// to specify whether they should run locally (on main thread) or in parallel.
-    pub fn new_with_callback_parent_and_local(
-        callback: Box<dyn FnMut() + Send>,
-        parent: Option<EffectId>,
-        local: bool,
-    ) -> Self {
-        Self {
-            sources: RwLock::new(IndexSet::default()),
-            outputs: RwLock::new(IndexSet::default()),
-            state: AtomicU8::new(ReactiveState::Clean as u8),
-            callback: Mutex::new(Some(callback)),
-            parent,
-            children: RwLock::new(Vec::new()),
-            local,
+            signals: RwLock::new(HashMap::with_hasher(FastHashBuilder)),
         }
     }
 
@@ -567,14 +634,53 @@ impl EffectMetadata {
     /// Use this for Computeds which start dirty so first access computes.
     pub fn new_dirty() -> Self {
         Self {
-            sources: RwLock::new(IndexSet::default()),
-            outputs: RwLock::new(IndexSet::default()),
             state: AtomicU8::new(ReactiveState::Dirty as u8),
+            flags: 0,
             callback: Mutex::new(None),
-            parent: None,
-            children: RwLock::new(Vec::new()),
-            local: false,
+            signals: RwLock::new(HashMap::with_hasher(FastHashBuilder)),
         }
+    }
+
+    /// Create new effect metadata with callback, parent, and flags
+    ///
+    /// Use this for Effects that can be deferred under load (producers).
+    /// Parent is stored in the global EFFECT_PARENT map, not in the metadata.
+    ///
+    /// Flags:
+    /// - `skippable`: Effect can be deferred under load
+    /// - `ui_updates_only`: Effect only wants UI updates (skipped on data-only updates)
+    pub fn new_with_callback_parent_and_flags(
+        callback: Box<dyn FnMut() + Send>,
+        _parent: Option<EffectId>,
+        skippable: bool,
+        ui_updates_only: bool,
+    ) -> Self {
+        // Parent is stored in EFFECT_PARENT map, not in metadata
+        let mut flags = 0;
+        if skippable {
+            flags |= FLAG_SKIPPABLE;
+        }
+        if ui_updates_only {
+            flags |= FLAG_UI_UPDATES_ONLY;
+        }
+        Self {
+            state: AtomicU8::new(ReactiveState::Clean as u8),
+            flags,
+            callback: Mutex::new(Some(callback)),
+            signals: RwLock::new(HashMap::with_hasher(FastHashBuilder)),
+        }
+    }
+
+    /// Create new effect metadata with callback, parent, and skippable flag
+    ///
+    /// Use this for Effects that can be deferred under load (producers).
+    /// Parent is stored in the global EFFECT_PARENT map, not in the metadata.
+    pub fn new_with_callback_parent_and_skippable(
+        callback: Box<dyn FnMut() + Send>,
+        parent: Option<EffectId>,
+        skippable: bool,
+    ) -> Self {
+        Self::new_with_callback_parent_and_flags(callback, parent, skippable, false)
     }
 
     // =========================================================================
@@ -584,6 +690,16 @@ impl EffectMetadata {
     /// Get the current reactive state
     pub fn get_state(&self) -> ReactiveState {
         ReactiveState::from_u8(self.state.load(Ordering::Acquire))
+    }
+
+    /// Get whether this effect is skippable
+    pub fn is_skippable(&self) -> bool {
+        (self.flags & FLAG_SKIPPABLE) != 0
+    }
+
+    /// Get whether this effect only wants UI updates (skips internal state updates)
+    pub fn is_ui_updates_only(&self) -> bool {
+        (self.flags & FLAG_UI_UPDATES_ONLY) != 0
     }
 
     /// Set the reactive state
@@ -632,33 +748,57 @@ impl EffectMetadata {
 
     /// Add a source to this node's dependency list
     ///
-    /// Uses IndexSet so duplicates are automatically ignored.
+    /// Uses HashMap so duplicates are automatically ignored.
     pub fn add_source(&self, source_id: SignalId) {
-        let mut sources = self.sources.write();
-        sources.insert(source_id);
+        let mut signals = self.signals.write();
+        signals.entry(source_id).or_default().is_source = true;
     }
 
     /// Remove a source from this node's dependency list
     pub fn remove_source(&self, source_id: SignalId) {
-        let mut sources = self.sources.write();
-        sources.swap_remove(&source_id);
+        let mut signals = self.signals.write();
+        if let Some(relation) = signals.get_mut(&source_id) {
+            relation.is_source = false;
+            // Remove entry if both flags are false
+            if !relation.is_source && !relation.is_output {
+                signals.remove(&source_id);
+            }
+        }
     }
 
-    /// Get all sources as a Vec
-    pub fn get_sources(&self) -> Vec<SignalId> {
-        self.sources.read().iter().copied().collect()
+    /// Check if a signal is a source (dependency) of this effect
+    ///
+    /// O(1) lookup using the underlying HashMap.
+    pub fn has_source(&self, signal_id: SignalId) -> bool {
+        self.signals
+            .read()
+            .get(&signal_id)
+            .map_or(false, |r| r.is_source)
+    }
+
+    /// Execute a closure with an iterator over sources
+    pub fn with_sources<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(SourcesIter<'_>) -> R,
+    {
+        fn filter_sources((id, relation): (&SignalId, &SignalRelation)) -> Option<SignalId> {
+            if relation.is_source { Some(*id) } else { None }
+        }
+        let signals = self.signals.read();
+        let iter = SourcesIter {
+            inner: signals.iter().filter_map(filter_sources as fn(_) -> _),
+        };
+        f(iter)
     }
 
     /// Clear all sources
     pub fn clear_sources(&self) {
-        self.sources.write().clear();
-    }
-
-    /// Set new sources (replaces existing)
-    pub fn set_sources(&self, new_sources: impl IntoIterator<Item = SignalId>) {
-        let mut sources = self.sources.write();
-        sources.clear();
-        sources.extend(new_sources);
+        let mut signals = self.signals.write();
+        // Set all is_source to false, remove entries where both flags are false
+        signals.retain(|_, relation| {
+            relation.is_source = false;
+            relation.is_output // Keep if is_output is still true
+        });
     }
 
     /// Run the callback if present (for effects)
@@ -676,44 +816,6 @@ impl EffectMetadata {
         self.callback.lock().is_some()
     }
 
-    /// Get the parent effect ID (if this effect was created inside another effect)
-    pub fn get_parent(&self) -> Option<EffectId> {
-        self.parent
-    }
-
-    /// Set the parent effect ID
-    pub fn set_parent(&mut self, parent: Option<EffectId>) {
-        self.parent = parent;
-    }
-
-    /// Add a child effect
-    pub fn add_child(&self, child: EffectId) {
-        self.children.write().push(child);
-    }
-
-    /// Get all child effect IDs
-    pub fn get_children(&self) -> Vec<EffectId> {
-        self.children.read().clone()
-    }
-
-    /// Clear all children (does not destroy them, just clears the list)
-    pub fn clear_children(&self) {
-        self.children.write().clear();
-    }
-
-    /// Remove a specific child from the children list
-    pub fn remove_child(&self, child: EffectId) {
-        self.children.write().retain(|c| *c != child);
-    }
-
-    /// Check if this effect is local (must run on main thread)
-    ///
-    /// Local effects are used for Python callbacks that need the GIL.
-    /// They run sequentially on the current thread instead of in parallel.
-    pub fn is_local(&self) -> bool {
-        self.local
-    }
-
     // =========================================================================
     // Output methods (for push-pull system)
     // =========================================================================
@@ -721,28 +823,45 @@ impl EffectMetadata {
     /// Add an output signal to this effect's output list
     ///
     /// Called when an effect writes to a signal via emit().
-    /// Uses IndexSet so duplicates are automatically ignored.
+    /// Uses HashMap so duplicates are automatically ignored.
     pub fn add_output(&self, signal_id: SignalId) {
-        let mut outputs = self.outputs.write();
-        outputs.insert(signal_id);
+        let mut signals = self.signals.write();
+        signals.entry(signal_id).or_default().is_output = true;
     }
 
-    /// Get all outputs as a Vec
-    pub fn get_outputs(&self) -> Vec<SignalId> {
-        self.outputs.read().iter().copied().collect()
+    /// Execute a closure with an iterator over outputs
+    pub fn with_outputs<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(OutputsIter<'_>) -> R,
+    {
+        fn filter_outputs((id, relation): (&SignalId, &SignalRelation)) -> Option<SignalId> {
+            if relation.is_output { Some(*id) } else { None }
+        }
+        let signals = self.signals.read();
+        let iter = OutputsIter {
+            inner: signals.iter().filter_map(filter_outputs as fn(_) -> _),
+        };
+        f(iter)
     }
 
-    /// Clear all outputs
-    pub fn clear_outputs(&self) {
-        self.outputs.write().clear();
-    }
-
-    /// Take all outputs (returns them and clears the list)
+    /// Clear all sources and outputs, calling callbacks for each
     ///
-    /// This is an atomic operation to get and clear outputs.
-    pub fn take_outputs(&self) -> Vec<SignalId> {
-        let mut outputs = self.outputs.write();
-        std::mem::take(&mut *outputs).into_iter().collect()
+    /// This is used when an effect re-runs to unsubscribe from old sources
+    /// and unregister from old outputs in a single pass.
+    pub fn clear_signals<F1, F2>(&self, mut on_source: F1, mut on_output: F2)
+    where
+        F1: FnMut(SignalId),
+        F2: FnMut(SignalId),
+    {
+        let mut signals = self.signals.write();
+        for (id, relation) in signals.drain() {
+            if relation.is_source {
+                on_source(id);
+            }
+            if relation.is_output {
+                on_output(id);
+            }
+        }
     }
 }
 
@@ -751,17 +870,6 @@ impl Default for EffectMetadata {
         Self::new()
     }
 }
-
-// Type aliases for backwards compatibility and documentation
-// These are no longer separate types but the names help document intent
-
-/// Alias for EffectMetadata - documents that this is used for Effect nodes
-#[allow(dead_code)]
-pub type EffectData = EffectMetadata;
-
-/// Alias for EffectMetadata - documents that this is used for Computed nodes
-#[allow(dead_code)]
-pub type ComputedData = EffectMetadata;
 
 // Arena manipulation functions
 
@@ -774,26 +882,33 @@ pub fn effect_arena_insert(metadata: EffectMetadata) -> EffectId {
     EffectId::new(key as u32)
 }
 
-/// Remove an effect from the arena
+/// Set the parent of an effect in the global EFFECT_PARENT map
+pub fn set_effect_parent(effect_id: EffectId, parent_id: EffectId) {
+    let guard = EFFECT_PARENT.pin();
+    guard.insert(effect_id, parent_id);
+}
+
+/// Remove an effect from the arena and clean up parent/children relationships
 pub fn effect_arena_remove(id: EffectId) -> Option<EffectMetadata> {
+    // Remove from parent map
+    {
+        let guard = EFFECT_PARENT.pin();
+        guard.remove(&id);
+    }
+
+    // Remove from children map
+    {
+        let guard = EFFECT_CHILDREN.pin();
+        guard.remove(&id);
+    }
+
+    // Remove from arena
     let mut arena = EFFECT_ARENA.write();
     if arena.contains(id.index()) {
         Some(arena.remove(id.index()))
     } else {
         None
     }
-}
-
-/// Access the global effect arena directly (for low-level operations)
-///
-/// Use this for operations that need direct arena access, like iterating
-/// or bulk operations. For single-effect operations, prefer EffectId methods.
-#[allow(dead_code)]
-pub fn with_effect_arena<F, R>(f: F) -> R
-where
-    F: FnOnce(&RwLock<Slab<EffectMetadata>>) -> R,
-{
-    f(&EFFECT_ARENA)
 }
 
 /// Mark an effect as pending and add it to the pending set.
@@ -827,11 +942,17 @@ pub fn mark_effect_pending(effect_id: EffectId) -> bool {
 /// Called when an effect is marked pending to immediately clean up stale children.
 /// This prevents child effects from hanging around between invalidation and execution.
 pub fn destroy_children(effect_id: EffectId) {
-    // Get children (if any)
-    let children = effect_id.children().unwrap_or_default();
-
-    // Clear the children list first
-    effect_id.clear_children();
+    // Take ownership of children by draining, then remove the empty entry
+    let children: Vec<EffectId> = {
+        let guard = EFFECT_CHILDREN.pin();
+        if let Some(rw) = guard.get(&effect_id) {
+            let children = std::mem::take(&mut *rw.write());
+            guard.remove(&effect_id);
+            children
+        } else {
+            return;
+        }
+    };
 
     // Recursively destroy each child
     for child_id in children {
@@ -842,11 +963,11 @@ pub fn destroy_children(effect_id: EffectId) {
         remove_from_pending_set(child_id);
 
         // Unsubscribe from all sources
-        if let Some(sources) = child_id.sources() {
+        child_id.with_sources(|sources| {
             for source_id in sources {
                 source_id.remove_subscriber(child_id);
             }
-        }
+        });
 
         // Remove from arena
         effect_arena_remove(child_id);
@@ -857,25 +978,22 @@ pub fn destroy_children(effect_id: EffectId) {
 ///
 /// This atomically drains the pending set and returns all effect IDs.
 /// Used by Effect::process_all() for efficient O(k) processing.
+///
+/// This implementation uses drain(..) instead of take() to preserve the
+/// IndexSet's allocation, reducing allocations across effect flushes.
 pub fn take_pending_effects() -> Vec<EffectId> {
-    let pending = std::mem::take(&mut *PENDING_EFFECTS.write());
-    pending.into_iter().collect()
+    PENDING_EFFECTS.write().drain(..).collect()
 }
 
-/// Get count of pending effects (from the pending set).
-///
-/// This is O(1) instead of iterating the entire arena.
-pub fn pending_effects_count() -> usize {
-    PENDING_EFFECTS.read().len()
-}
-
-/// Clear the pending flag for an effect and remove from pending set.
-///
-/// Called when an effect has been processed.
-#[allow(dead_code)]
-pub fn clear_effect_pending(effect_id: EffectId) {
-    effect_id.set_state(ReactiveState::Clean);
-    PENDING_EFFECTS.write().swap_remove(&effect_id);
+pub fn take_pending_effects_split(must_run: &mut Vec<EffectId>, skippable: &mut Vec<EffectId>) {
+    let mut pending = PENDING_EFFECTS.write();
+    for effect in pending.drain(..) {
+        if effect.is_skippable() {
+            skippable.push(effect);
+        } else {
+            must_run.push(effect);
+        }
+    }
 }
 
 /// Remove an effect from the pending set (used when effect is destroyed).
@@ -887,25 +1005,20 @@ pub fn remove_from_pending_set(effect_id: EffectId) {
 // Three-state reactive system functions
 // ============================================================================
 
-/// Mark an effect as Check and add it to the pending set for eventual processing.
+/// Add a Check-state effect to the pending set for eventual processing.
 ///
 /// This is used for indirect dependents in the three-state system. When a signal
 /// changes, direct subscribers are marked Dirty, but their downstream dependents
 /// are only marked Check (they might not actually need to recompute).
 ///
-/// Returns true if the effect was newly added to the pending set.
-pub fn mark_effect_pending_for_check(effect_id: EffectId) -> bool {
-    // Only add to pending set if the effect now needs work
-    // (was previously Clean)
-    let was_clean = effect_id.state() == ReactiveState::Clean;
-
-    // The state upgrade is already done by the caller (mark_check_recursive)
-    // We just need to add to pending set
-    if was_clean {
-        PENDING_EFFECTS.write().insert(effect_id);
-    }
-
-    was_clean
+/// Note: The caller (mark_check_recursive) is responsible for:
+/// 1. Verifying the effect was previously Clean
+/// 2. Setting the state to Check before calling this function
+pub fn mark_effect_pending_for_check(effect_id: EffectId) {
+    cov_mark::hit!(check_effect_added_to_pending);
+    // The caller has already verified this was Clean and set it to Check.
+    // We just need to add to the pending set.
+    PENDING_EFFECTS.write().insert(effect_id);
 }
 
 /// Mark an effect as Dirty and add to pending set (convenience wrapper).
@@ -946,7 +1059,7 @@ mod tests {
         effect_arena_remove(id);
 
         // All operations should return None for stale ID or defaults
-        assert_eq!(id.sources(), None);
+        assert!(id.with_sources(|_| ()).is_none());
         assert_eq!(id.state(), ReactiveState::Clean); // Returns default for stale access
         assert_eq!(id.add_source(SignalId::new(1)), None);
     }
