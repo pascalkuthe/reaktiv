@@ -1,11 +1,14 @@
+use crate::arena::ReactiveState;
+use crate::arena::effect_arena::take_pending_effects_split;
 use crate::arena::signal_arena::remove_signal_writer;
 use crate::arena::with_signal_arena;
 use crate::arena::{
     EffectId, EffectMetadata, current_effect, destroy_children, effect_arena_insert,
-    effect_arena_remove, mark_effect_pending, pending_effects_count, remove_from_pending_set,
+    effect_arena_remove, mark_effect_pending, remove_from_pending_set, set_effect_parent,
     take_pending_effects,
 };
 use std::cell::Cell;
+use std::time::Instant;
 
 // Thread-local flag to track if effect processing has been scheduled.
 // This enables debouncing - multiple signal emissions only schedule one processing.
@@ -13,17 +16,18 @@ thread_local! {
     static PROCESSING_SCHEDULED: Cell<bool> = const { Cell::new(false) };
 }
 
-/// Schedule effect processing (non-blocking debounce)
+/// Schedule effect processing without running them immediately
 ///
-/// This marks that effects need to be processed, but doesn't process them immediately.
-/// Multiple calls to this function only schedule one processing.
-/// The actual processing happens when `flush_effects()` is called (typically by an event loop)
-/// or when a transaction ends.
+/// This marks that effects need to be processed but doesn't run them yet.
+/// Multiple calls only schedule one processing (automatic debouncing).
 ///
-/// This also notifies the async effect loop (if running) to wake up and process effects.
-/// If no async loop is running, the notification is a no-op.
+/// Effects actually run when:
+/// - `flush_effects()` is called manually
+/// - A transaction ends
+/// - The async effect loop wakes up (if using `spawn_effect_loop()`)
 ///
-/// This enables efficient batching of multiple signal changes into a single effect run.
+/// This function is called automatically by `signal.emit()`, so you typically
+/// don't need to call it yourself.
 pub fn schedule_effect_processing() {
     PROCESSING_SCHEDULED.with(|scheduled| {
         scheduled.set(true);
@@ -41,23 +45,87 @@ pub fn is_processing_scheduled() -> bool {
     PROCESSING_SCHEDULED.with(std::cell::Cell::get)
 }
 
-/// Flush all pending effects (explicit processing trigger)
+/// Flush pending effects with a time budget
 ///
-/// This is the main entry point for the application's event loop to process effects.
-/// It clears the scheduled flag and processes all pending effects.
+/// This processes pending effects until the specified budget is exhausted.
+/// Effects that would exceed the budget are deferred and returned.
 ///
-/// Returns the number of effects processed.
+/// Skippable effects (producers) are processed first until the budget is exceeded.
+/// Non-skippable effects (consumers) are always run, but with skip_skippable=true
+/// when over budget to avoid running producers during pull.
+///
+/// Returns (effects_processed, deferred_effects)
 ///
 /// # Usage
 ///
-/// Call this from your event loop or at points where you want effects to be processed:
+/// ```ignore
+/// let budget = Duration::from_millis(16); // One frame at 60fps
+/// let (processed, deferred) = flush_effects_with_budget(budget);
+/// // Handle deferred effects (e.g., spawn on another thread)
+/// ```
+pub(crate) fn flush_effects_with_budget(
+    budget: std::time::Duration,
+    must_run: &mut Vec<EffectId>,
+    skippable: &mut Vec<EffectId>,
+) {
+    // Clear the scheduled flag
+    PROCESSING_SCHEDULED.with(|scheduled| {
+        scheduled.set(false);
+    });
+
+    let start = Instant::now();
+
+    // Take all pending effect IDs atomically from the pending set
+    take_pending_effects_split(must_run, skippable);
+
+    // Process skippable effects until budget exceeded
+    // pop() removes from the end, so what remains are the deferred effects
+    let mut i = 0;
+    let over_budget = loop {
+        if start.elapsed() > budget {
+            break true;
+        }
+        let Some(effect_id) = skippable.get(i) else {
+            break false;
+        };
+        if effect_id.state() != ReactiveState::Clean {
+            effect_id.update_if_necessary(false);
+        }
+        i += 1;
+    };
+    skippable.drain(..i);
+    // After the loop, skippable contains only deferred effects (those not popped)
+
+    // Run must-run effects, skip pulling on skippable if over budget
+    for effect_id in must_run {
+        if effect_id.state() != ReactiveState::Clean {
+            effect_id.update_if_necessary(over_budget);
+        }
+    }
+}
+
+/// Process all pending effects immediately
+///
+/// This is the main way to trigger effect processing. Call this after making changes
+/// to signals, or integrate it into your event loop for automatic processing.
+///
+/// Returns the number of effects processed.
+///
+/// # Example
 ///
 /// ```ignore
-/// // In an event loop
+/// // Manually trigger effect processing
+/// signal.emit();
+/// flush_effects();  // All pending effects run now
+///
+/// // Or integrate into an event loop
 /// loop {
 ///     handle_events();
 ///     flush_effects();  // Process any pending reactive updates
 /// }
+///
+/// // Or use the async effect loop
+/// spawn_effect_loop();  // Automatically processes effects
 /// ```
 pub fn flush_effects() -> usize {
     // Clear the scheduled flag
@@ -105,21 +173,11 @@ fn run_single_effect_internal(effect_id: EffectId, remove_from_pending: bool) {
     // Child effects were already destroyed when this effect was marked dirty
     // (see mark_effect_pending/mark_effect_dirty in effect_arena.rs)
 
-    // Clear old outputs (for push-pull system)
-    // Take the outputs and remove this effect from each signal's writers map
-    if let Some(old_outputs) = effect_id.take_outputs() {
-        for signal_id in old_outputs {
-            remove_signal_writer(signal_id, effect_id);
-        }
-    }
-
-    // Clear old subscriptions
-    if let Some(old_sources) = effect_id.sources() {
-        for source_id in &old_sources {
-            source_id.remove_subscriber(effect_id);
-        }
-    }
-    effect_id.clear_sources();
+    // Clear old sources and outputs in a single pass
+    effect_id.clear_signals(
+        |source_id| source_id.remove_subscriber(effect_id),
+        |output_id| remove_signal_writer(output_id, effect_id),
+    );
 
     // Set this effect as the current effect (for dependency tracking and parent/child relationships)
     // Signal::track_dependency() will check current_effect() and subscribe this effect.
@@ -148,20 +206,21 @@ pub fn run_single_effect(effect_id: EffectId) {
 
 /// Run a closure without tracking dependencies
 ///
-/// Use this when you need to read a signal's value without creating a dependency.
-/// This is useful for:
-/// - Reading initial values without subscribing
-/// - Implementing one-time reads
-/// - Avoiding circular dependencies
+/// Use this when you need to read signals without creating dependencies.
+/// Useful for one-time reads or avoiding circular dependencies.
 ///
 /// # Example
 /// ```ignore
 /// let effect = Effect::new(move || {
-///     // This read creates a dependency
-///     let tracked_value = signal1.get();
+///     // This read creates a dependency - effect will re-run when signal1 changes
+///     signal1.track_dependency();
+///     let tracked_value = value1;
 ///
-///     // This read does NOT create a dependency
-///     let untracked_value = untracked(|| signal2.get());
+///     // This read does NOT create a dependency - effect won't re-run when signal2 changes
+///     let untracked_value = untracked(|| {
+///         signal2.track_dependency();  // This call is ignored
+///         value2
+///     });
 /// });
 /// ```
 pub fn untracked<F, R>(f: F) -> R
@@ -175,58 +234,41 @@ where
     f()
 }
 
-/// Run a single effect for pull-based verification
+/// Side-effectful computation that automatically re-runs when dependencies change
 ///
-/// This is called from SignalId::pull() when a stale writer effect needs to run.
-/// It's similar to run_single_effect but also removes the effect from the pending set.
+/// Effects track which signals they read and automatically re-run when any of those
+/// signals change. Multiple rapid changes are automatically batched together.
 ///
-/// This function handles the full lifecycle of running an effect.
-/// See `run_single_effect_internal` for details.
-#[allow(dead_code)]
-pub fn run_single_effect_for_pull(effect_id: EffectId) {
-    run_single_effect_internal(effect_id, true);
-}
-
-/// Reactive computation with side effects and automatic dependency tracking
+/// # How it works
+/// 1. Effect runs immediately on creation, tracking all `signal.track_dependency()` calls
+/// 2. When any tracked signal changes, the effect is marked pending
+/// 3. Multiple changes are batched - 20 rapid signal changes result in just 1 effect run
+/// 4. Call `flush_effects()` to process all pending effects, or use `spawn_effect_loop()` for async processing
 ///
-/// # Architecture
-/// Effect is a thin owning wrapper around EffectId. All effect state lives in
-/// the arena's EffectMetadata:
-/// - callback: the effect function
-/// - sources: signals this effect depends on
-/// - pending: whether the effect needs to run
-///
-/// This eliminates the need for external registries like EFFECT_REGISTRY.
-///
-/// # How effects work:
-/// 1. Create with a function that reads reactive signals
-/// 2. Effect runs immediately, tracking all signal reads as dependencies
-/// 3. When any source signal changes, effect is marked pending
-/// 4. Pending effects are processed by the executor
-/// 5. Duplicate invalidations are deduplicated via the pending flag
-///
-/// # Debouncing:
-/// - `pending` flag in arena tracks if effect is already scheduled
-/// - First invalidation: set pending=true
-/// - Subsequent invalidations: skip (already pending)
-/// - Effect runs: clear pending
-/// - Result: 20 rapid changes -> 1 effect run, not 20
-///
-/// # Example:
+/// # Example
 /// ```ignore
-/// let power = Effect::new(|| {
-///     println!("Power: {}", circuit.voltage * circuit.current);
+/// let voltage_signal = Signal::new();
+/// let current_signal = Signal::new();
+///
+/// // Effect runs immediately and tracks both signals
+/// let effect = Effect::new(|| {
+///     voltage_signal.track_dependency();
+///     current_signal.track_dependency();
+///     println!("Power: {}", voltage * current);
 /// });
 ///
-/// // Effect runs immediately during construction
-/// // Tracks dependencies on circuit.voltage and circuit.current
+/// // Multiple rapid changes are batched
+/// voltage_signal.emit();  // Effect marked pending
+/// voltage_signal.emit();  // Already pending, skipped
+/// voltage_signal.emit();  // Already pending, skipped
 ///
-/// circuit.voltage = 10.0;  // Effect marked pending
-/// circuit.voltage = 11.0;  // Skipped (already pending)
-/// circuit.voltage = 12.0;  // Skipped (already pending)
-///
-/// Effect::process_all();  // Effect runs once with final voltage=12.0
+/// flush_effects();  // Effect runs once with final values
 /// ```
+///
+/// # Skippable effects
+/// Use `Effect::new_skippable()` for effects that can be deferred under load.
+/// This is useful for non-critical UI updates that can run in the background
+/// while keeping the main UI responsive.
 pub struct Effect {
     /// Arena ID for this effect's metadata (callback, sources, pending).
     /// This is the sole identifier for this effect.
@@ -238,41 +280,56 @@ impl Effect {
     ///
     /// The callback is stored directly in the arena, making Effect a thin wrapper.
     /// If created inside another effect's callback, establishes parent/child relationship.
-    /// This effect can run in parallel with other effects.
     pub fn new<F>(f: F) -> Self
     where
         F: FnMut() + Send + 'static,
     {
-        Self::new_internal(f, false)
+        Self::new_internal(f, false, false)
     }
 
-    /// Create a new local effect (runs immediately, always on main thread)
+    /// Create a new skippable effect (runs immediately)
     ///
-    /// Local effects are used for Python callbacks that require the GIL.
-    /// They run sequentially on the current thread instead of in parallel.
-    /// If created inside another effect's callback, establishes parent/child relationship.
-    pub fn new_local<F>(f: F) -> Self
+    /// Skippable effects can be deferred under load. They are typically producer
+    /// effects (like validation) that can be skipped when consumers (like Qt bridge)
+    /// need to run within a time budget.
+    pub fn new_skippable<F>(f: F) -> Self
     where
         F: FnMut() + Send + 'static,
     {
-        Self::new_internal(f, true)
+        Self::new_internal(f, true, false)
     }
 
-    /// Internal constructor for effects with configurable local flag
-    fn new_internal<F>(f: F, local: bool) -> Self
+    /// Create a new effect that only wants UI updates (skipped on data-only updates)
+    ///
+    /// UI-updates-only effects are skipped when signals emit via `emit_from_ui()`.
+    /// They only run when signals emit via `emit()` or `emit_from_api()`.
+    pub fn new_ui_updates_only<F>(f: F) -> Self
+    where
+        F: FnMut() + Send + 'static,
+    {
+        Self::new_internal(f, false, true)
+    }
+
+    /// Internal effect constructor
+    fn new_internal<F>(f: F, skippable: bool, ui_updates_only: bool) -> Self
     where
         F: FnMut() + Send + 'static,
     {
         // 1. Check if we're inside another effect (establish parent/child relationship)
         let parent = current_effect();
 
-        // 2. Create EffectMetadata with the callback, parent, and local flag
-        let metadata =
-            EffectMetadata::new_with_callback_parent_and_local(Box::new(f), parent, local);
+        // 2. Create EffectMetadata with the callback and flags
+        let metadata = EffectMetadata::new_with_callback_parent_and_flags(
+            Box::new(f),
+            parent,
+            skippable,
+            ui_updates_only,
+        );
         let id = effect_arena_insert(metadata);
 
-        // 3. Register as child of parent (if any)
+        // 3. Register parent-child relationship in global maps (if any)
         if let Some(parent_id) = parent {
+            set_effect_parent(id, parent_id);
             parent_id.add_child(id);
         }
 
@@ -296,11 +353,11 @@ impl Effect {
     pub(crate) fn run_now(&self) {
         // 1. Clear old subscriptions before re-running
         //    Get the old sources and unsubscribe from them
-        if let Some(old_sources) = self.id.sources() {
-            for source_id in &old_sources {
+        self.id.with_sources(|old_sources| {
+            for source_id in old_sources {
                 source_id.remove_subscriber(self.id);
             }
-        }
+        });
         self.id.clear_sources();
 
         // 2. Set this effect as the current effect (for dependency tracking and parent/child relationships)
@@ -330,15 +387,17 @@ impl Effect {
     }
 
     /// Get the EffectId for this effect (internal use only)
-    #[allow(dead_code)]
     pub(crate) fn id(&self) -> EffectId {
         self.id
     }
 
-    /// Get current sources (internal use only)
-    #[allow(dead_code)]
-    pub(crate) fn sources(&self) -> Vec<crate::arena::SignalId> {
-        self.id.sources().unwrap_or_default()
+    /// Create an Effect wrapper from an existing EffectId (internal use only)
+    ///
+    /// This does NOT run the effect or establish parent/child relationships.
+    /// Use this when you've already created and set up the EffectId externally
+    /// (e.g., in Computed) and just want Effect to handle cleanup via Drop.
+    pub(crate) fn from_raw(id: EffectId) -> Self {
+        Self { id }
     }
 
     /// Process all pending effects using fixed-point iteration
@@ -381,20 +440,13 @@ impl Effect {
                 // Use update_if_necessary to handle three-state system
                 // This handles Check state (verify sources) and Dirty state (run)
                 if effect_id.state() != ReactiveState::Clean {
-                    effect_id.update_if_necessary();
+                    effect_id.update_if_necessary(false);
                     total += 1;
                 }
             }
         }
 
         total
-    }
-
-    /// Get count of pending effects
-    ///
-    /// This is O(1) using the efficient pending set.
-    pub fn queue_len() -> usize {
-        pending_effects_count()
     }
 }
 
@@ -403,49 +455,47 @@ impl Drop for Effect {
         // Check if this effect has a parent (is a child effect)
         let has_parent = self.id.parent().is_some();
 
+        // 1. Remove from pending set (if pending)
+        remove_from_pending_set(self.id);
+
+        // 2. Remove ourselves from each signal's subscribers
+        // This is done even for child effects - if the user explicitly drops
+        // the Effect, they want it to stop reacting. Users can use mem::forget
+        // to let the parent handle cleanup if they want the old behavior.
+        let effect_id = self.id;
+        let exists = self.id.with_sources(|sources| {
+            with_signal_arena(|arena| {
+                for source_id in sources {
+                    if let Some(node) = arena.get(source_id.index()) {
+                        node.subscribers
+                            .write()
+                            .retain(|&eid| eid != effect_id);
+                    }
+                }
+            });
+        });
+        if exists.is_none() {
+            return; // Already removed
+        }
+
+        // 3. Remove ourselves from SIGNAL_WRITERS for each output
+        self.id.with_outputs(|outputs| {
+            for signal_id in outputs {
+                remove_signal_writer(signal_id, effect_id);
+            }
+        });
+
         if has_parent {
-            // Child effects created inside a parent's callback should NOT be cleaned up
-            // when their Effect is dropped. The parent owns them and will clean them
-            // up when it re-runs (via destroy_children) or when the parent is dropped.
-            //
-            // This allows child effects to remain active even after the local variable
-            // goes out of scope in the parent's callback.
+            // Child effects: unsubscribe from signals (done above) but don't
+            // destroy from arena - the parent owns the arena entry and will
+            // clean it up when the parent re-runs or is destroyed.
             return;
         }
 
         // For top-level effects (no parent), do full cleanup:
 
-        // 1. Remove from pending set (if pending)
-        remove_from_pending_set(self.id);
-
-        // 2. Destroy all child effects (using function from effect_arena)
+        // 5. Destroy all child effects (using function from effect_arena)
         destroy_children(self.id);
-
-        // 3. Get all sources and outputs from arena
-        let (sources, outputs) = if let Some(result) = self
-            .id
-            .with(|metadata| (metadata.get_sources(), metadata.get_outputs()))
-        {
-            result
-        } else {
-            return; // Already removed
-        };
-
-        // 4. Remove ourselves from each signal's subscribers
-        with_signal_arena(|arena| {
-            for source_id in sources {
-                if let Some(node) = arena.get(source_id.index()) {
-                    node.subscribers
-                        .write()
-                        .retain(|sub| sub.effect_id != self.id);
-                }
-            }
-        });
-
-        // 5. Remove ourselves from SIGNAL_WRITERS for each output
-        for signal_id in outputs {
-            remove_signal_writer(signal_id, self.id);
-        }
 
         // 6. Deallocate from arena
         effect_arena_remove(self.id);
@@ -502,14 +552,24 @@ mod tests {
         assert_eq!(counter.load(Ordering::Relaxed), 1);
 
         // Verify subscription was established correctly
-        let subscribers = signal_node_id.subscribers().unwrap();
-        assert_eq!(subscribers.len(), 1);
-        assert_eq!(subscribers[0].effect_id, effect.id());
+        signal_node_id.with_subscribers(|subscribers| {
+            assert_eq!(subscribers.len(), 1);
+            assert!(subscribers.contains(&effect.id()));
+        });
 
         // Verify effect tracks signal as source
-        let sources = effect.id().sources().unwrap();
-        assert_eq!(sources.len(), 1);
-        assert_eq!(sources[0], signal_node_id);
+        effect.id().with_sources(|sources| {
+            assert_eq!(sources.count(), 1);
+        });
+        let has_signal = effect.id().with_sources(|sources| {
+            for s in sources {
+                if s == signal_node_id {
+                    return true;
+                }
+            }
+            false
+        }).unwrap_or(false);
+        assert!(has_signal);
 
         // Emit signal - schedules effect processing (debounced)
         signal.emit();
@@ -594,53 +654,6 @@ mod tests {
     }
 
     #[test]
-    fn local_effect_runs_sequentially() {
-        // Verify local effects are marked as local
-        let effect = Effect::new_local(|| {});
-        assert!(effect.id().is_local());
-
-        // Regular effects are not local
-        let regular_effect = Effect::new(|| {});
-        assert!(!regular_effect.id().is_local());
-    }
-
-    #[test]
-    fn local_effect_executes_correctly() {
-        use std::sync::atomic::AtomicI32;
-
-        let counter = Arc::new(AtomicI32::new(0));
-        let counter_clone = counter.clone();
-
-        // Create a local effect
-        let _effect = Effect::new_local(move || {
-            counter_clone.fetch_add(1, Ordering::Relaxed);
-        });
-
-        // Effect runs immediately during construction
-        assert_eq!(counter.load(Ordering::Relaxed), 1);
-
-        // Create a signal and subscribe the effect
-        let signal = crate::Signal::new();
-        let signal_node_id = signal.node_id();
-        let counter_clone2 = counter.clone();
-
-        let _effect2 = Effect::new_local(move || {
-            signal_node_id.track_dependency();
-            counter_clone2.fetch_add(1, Ordering::Relaxed);
-        });
-
-        // Effect ran during construction
-        assert_eq!(counter.load(Ordering::Relaxed), 2);
-
-        // Emit and flush
-        signal.emit();
-        flush_effects();
-
-        // Effect ran again after flush
-        assert_eq!(counter.load(Ordering::Relaxed), 3);
-    }
-
-    #[test]
     fn debounce_multiple_emissions() {
         // Test that multiple signal emissions only trigger processing once
         use std::sync::atomic::AtomicI32;
@@ -694,41 +707,5 @@ mod tests {
         // Flush processes pending effects
         flush_effects();
         assert_eq!(counter.load(Ordering::Relaxed), 2);
-    }
-
-    #[test]
-    fn parallel_and_local_effects_both_process() {
-        // Test that both parallel and local effects are processed
-        use std::sync::atomic::AtomicI32;
-
-        let signal = crate::Signal::new();
-        let signal_node_id = signal.node_id();
-
-        let parallel_counter = Arc::new(AtomicI32::new(0));
-        let local_counter = Arc::new(AtomicI32::new(0));
-
-        let parallel_clone = parallel_counter.clone();
-        let _parallel_effect = Effect::new(move || {
-            signal_node_id.track_dependency();
-            parallel_clone.fetch_add(1, Ordering::Relaxed);
-        });
-
-        let local_clone = local_counter.clone();
-        let _local_effect = Effect::new_local(move || {
-            signal_node_id.track_dependency();
-            local_clone.fetch_add(1, Ordering::Relaxed);
-        });
-
-        // Both ran during construction
-        assert_eq!(parallel_counter.load(Ordering::Relaxed), 1);
-        assert_eq!(local_counter.load(Ordering::Relaxed), 1);
-
-        // Emit and flush
-        signal.emit();
-        flush_effects();
-
-        // Both ran after flush
-        assert_eq!(parallel_counter.load(Ordering::Relaxed), 2);
-        assert_eq!(local_counter.load(Ordering::Relaxed), 2);
     }
 }
