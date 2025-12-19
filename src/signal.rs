@@ -1,24 +1,34 @@
 use crate::arena::signal_arena::add_signal_writer;
 use crate::arena::{
-    AnySubscriber, EffectId, SignalId, SignalMetadata, current_effect, mark_effect_pending,
-    signal_arena_insert, signal_arena_remove,
+    EffectId, SignalId, SignalMetadata, current_effect, mark_effect_pending, signal_arena_insert,
+    signal_arena_remove,
 };
 use crate::effect::schedule_effect_processing;
 use crate::transaction::is_transaction_active;
 
-/// Public interface for reading reactive values and tracking dependencies
+/// Lightweight reactive marker that tracks dependencies without owning data
 ///
-/// # Key insight:
-/// Signal does NOT own the value. It's just metadata tracking.
-/// The value lives in the owner struct.
+/// A Signal is just 4 bytes of metadata - your actual values stay in your structs.
+/// This is different from wrapping signals like `Signal<T>` that own the data.
 ///
-/// # Usage:
+/// # Usage
 /// ```ignore
-/// // Create a signal
-/// let signal = Signal::new();
+/// struct MyComponent {
+///     value: f64,
+///     signal: Signal,  // Just metadata, doesn't own the value
+/// }
 ///
-/// // Track dependency (if an observer is active):
-/// signal.track_dependency();
+/// impl MyComponent {
+///     fn set(&mut self, v: f64) {
+///         self.value = v;
+///         self.signal.emit();  // Notify subscribers
+///     }
+///
+///     fn get(&self) -> f64 {
+///         self.signal.track_dependency();  // Track if inside an effect
+///         self.value
+///     }
+/// }
 /// ```
 pub struct Signal {
     node_id: SignalId,
@@ -33,9 +43,16 @@ impl Signal {
     }
 
     /// Get the node ID for this signal (internal use only)
-    #[allow(dead_code)]
     pub(crate) fn node_id(&self) -> SignalId {
         self.node_id
+    }
+
+    /// Create a Signal wrapper from an existing SignalId (internal use only)
+    ///
+    /// Use this when you've already created the SignalId externally
+    /// (e.g., in Computed) and just want Signal to handle cleanup via Drop.
+    pub(crate) fn from_raw(id: SignalId) -> Self {
+        Self { node_id: id }
     }
 
     /// Track this signal as a dependency (if an effect is currently executing)
@@ -46,14 +63,8 @@ impl Signal {
         if let Some(effect_id) = current_effect() {
             // Subscribe the effect to this signal
             effect_id.add_source(self.node_id);
-            let subscriber = AnySubscriber::new(effect_id, false);
-            self.node_id.add_subscriber(subscriber);
+            self.node_id.add_subscriber(effect_id);
         }
-    }
-
-    /// Get current version (for memoization checks)
-    pub fn version(&self) -> u64 {
-        self.node_id.version().unwrap_or(0)
     }
 
     /// Emit a change notification (default: from API, all subscribers notified)
@@ -87,18 +98,17 @@ impl Signal {
         if let Some(effect_id) = current_effect() {
             // Check for read-write cycle: effect reads AND writes the same signal
             // This would cause an infinite loop, so we treat the read as untracked
-            if let Some(sources) = effect_id.sources() {
-                if sources.contains(&self.node_id) {
-                    eprintln!(
-                        "Warning: Effect {:?} both reads and writes signal {:?}. \
-                         This would cause an infinite loop. \
-                         The read is being treated as untracked.",
-                        effect_id, self.node_id
-                    );
-                    // Remove the subscription (treat as untracked)
-                    self.node_id.remove_subscriber(effect_id);
-                    effect_id.remove_source(self.node_id);
-                }
+            let is_source = effect_id.has_source(self.node_id);
+            if is_source {
+                eprintln!(
+                    "Warning: Effect {:?} both reads and writes signal {:?}. \
+                     This would cause an infinite loop. \
+                     The read is being treated as untracked.",
+                    effect_id, self.node_id
+                );
+                // Remove the subscription (treat as untracked)
+                self.node_id.remove_subscriber(effect_id);
+                effect_id.remove_source(self.node_id);
             }
 
             // Add to effect's outputs
@@ -106,9 +116,6 @@ impl Signal {
             // Add effect to signal's writers
             add_signal_writer(self.node_id, effect_id);
         }
-
-        // Increment version
-        self.node_id.increment_version();
 
         // Notify subscribers (filtered by origin)
         self.notify_subscribers(is_from_ui);
@@ -124,26 +131,26 @@ impl Signal {
     /// Actual processing is deferred until `flush_effects()` is called or when
     /// a transaction ends, enabling efficient batching of multiple signal changes.
     fn notify_subscribers(&self, is_from_ui: bool) {
-        if let Some(subscribers) = self.node_id.subscribers() {
-            for subscriber in subscribers {
+        self.node_id.with_subscribers(|subscribers| {
+            for effect_id in subscribers {
                 // Filter: if this is a UI-only update and subscriber only wants data updates, skip
-                if is_from_ui && subscriber.track_ui_updates_only {
+                if is_from_ui && effect_id.is_ui_updates_only() {
                     continue;
                 }
 
                 // Direct subscribers are Dirty (source definitely changed)
                 // This uses mark_effect_pending which sets state to Dirty and adds to pending set
-                mark_effect_pending(subscriber.effect_id);
+                mark_effect_pending(*effect_id);
 
                 // Their downstream dependents are Check (might be affected)
                 // Recursively mark effects that depend on this subscriber's outputs
-                if let Some(outputs) = subscriber.effect_id.outputs() {
+                effect_id.with_outputs(|outputs| {
                     for output in outputs {
                         output.mark_subscribers_check();
                     }
-                }
+                });
             }
-        }
+        });
 
         // If not in a transaction AND not inside an effect callback, schedule processing.
         // When inside an effect callback (current_effect is Some), we defer processing to avoid
@@ -156,8 +163,8 @@ impl Signal {
     }
 
     /// Subscribe an observer to this signal
-    pub fn subscribe(&self, subscriber: AnySubscriber) {
-        self.node_id.add_subscriber(subscriber);
+    pub fn subscribe(&self, effect_id: EffectId) {
+        self.node_id.add_subscriber(effect_id);
     }
 
     /// Unsubscribe an effect from this signal
@@ -168,14 +175,13 @@ impl Signal {
 
 impl Drop for Signal {
     fn drop(&mut self) {
-        // Get all subscribers first
-        if let Some(subscribers) = self.node_id.subscribers() {
-            // Notify all subscribers to remove this signal from their sources
-            for subscriber in subscribers {
+        // Notify all subscribers to remove this signal from their sources
+        self.node_id.with_subscribers(|subscribers| {
+            for effect_id in subscribers {
                 // Remove this signal from the effect's sources list
-                subscriber.effect_id.remove_source(self.node_id);
+                effect_id.remove_source(self.node_id);
             }
-        }
+        });
 
         // Deallocate from arena
         signal_arena_remove(self.node_id);
@@ -212,7 +218,7 @@ mod tests {
         });
 
         // Duplicate subscriptions are handled - the effect sees only one source
-        let sources = effect.sources();
-        assert_eq!(sources.len(), 1);
+        let source_count = effect.id().with_sources(|sources| sources.count()).unwrap_or(0);
+        assert_eq!(source_count, 1);
     }
 }
