@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 440 130">
+  <defs>
+    <linearGradient id="flaskGrad" x1="0%" y1="100%" x2="0%" y2="0%">
+      <stop offset="0%" style="stop-color:#0d9488"/>
+      <stop offset="100%" style="stop-color:#14b8a6"/>
+    </linearGradient>
+    <linearGradient id="burstGrad" x1="0%" y1="100%" x2="0%" y2="0%">
+      <stop offset="0%" style="stop-color:#f97316"/>
+      <stop offset="100%" style="stop-color:#fb923c"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Icon - flask body matches text cap height, burst extends above like ascenders -->
+  <g transform="translate(5, 30) scale(0.88)">
+    <!-- Main flask -->
+    <path d="M52 25 L52 38 L36 78 Q34 86 42 90 L78 90 Q86 86 84 78 L68 38 L68 25"
+          fill="url(#flaskGrad)"/>
+
+    <!-- Flask neck highlight -->
+    <rect x="52" y="22" width="16" height="6" rx="1" fill="#2dd4bf"/>
+
+    <!-- Glass reflection -->
+    <path d="M54 40 L44 75 L46 75 L56 42 Z" fill="white" opacity="0.2"/>
+
+    <!-- Explosion burst -->
+    <g fill="url(#burstGrad)">
+      <polygon points="60,5 63,15 70,8 65,18 75,15 67,22 60,20 53,22 45,15 55,18 50,8 57,15"/>
+      <circle cx="60" cy="0" r="3"/>
+      <circle cx="45" cy="5" r="2.5"/>
+      <circle cx="75" cy="5" r="2.5"/>
+      <circle cx="38" cy="15" r="2"/>
+      <circle cx="82" cy="12" r="2"/>
+    </g>
+
+    <!-- Bubbles inside -->
+    <circle cx="52" cy="70" r="4" fill="white" opacity="0.3"/>
+    <circle cx="65" cy="78" r="3" fill="white" opacity="0.3"/>
+    <circle cx="58" cy="60" r="2.5" fill="white" opacity="0.25"/>
+
+    <!-- Rising bubbles -->
+    <circle cx="55" cy="30" r="2" fill="white" opacity="0.4"/>
+    <circle cx="62" cy="25" r="1.5" fill="white" opacity="0.4"/>
+  </g>
+
+  <!-- Text "Reaktiv" - dark text for light backgrounds -->
+  <text x="95" y="100" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif" font-size="68" font-weight="700" fill="#0f172a">Reaktiv</text>
+</svg>

@@ -1,10 +1,11 @@
-<p>
-  <img src="docs/logo-with-text.svg" alt="Reaktiv">
-</p>
+<picture>
+  <source srcset="https://raw.githubusercontent.com/pascalkuthe/reaktiv/main/docs/logo-with-text-dark.svg" media="(prefers-color-scheme: dark)">
+  <img src="https://raw.githubusercontent.com/pascalkuthe/reaktiv/main/docs/logo-with-text-light.svg" alt="Reaktiv">
+</picture>
 
 [![Crates.io](https://img.shields.io/crates/v/reaktiv.svg)](https://crates.io/crates/reaktiv)
 [![Documentation](https://docs.rs/reaktiv/badge.svg)](https://docs.rs/reaktiv)
-[![CI](https://github.com/pascalkuthe/reaktiv/actions/workflows/ci.yml/badge.svg)](https://github.com/pascalkuthe/reaktiv/actions)
+[![CI](https://img.shields.io/github/actions/workflow/status/pascalkuthe/reaktiv/ci.yml?branch=main&label=CI)](https://github.com/pascalkuthe/reaktiv/actions)
 [![MSRV](https://img.shields.io/crates/msrv/reaktiv)](https://crates.io/crates/reaktiv)
 
 A standalone, flexible fine-grained reactivity library designed to be unintrusive.
