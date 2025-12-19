@@ -467,9 +467,7 @@ impl Drop for Effect {
             with_signal_arena(|arena| {
                 for source_id in sources {
                     if let Some(node) = arena.get(source_id.index()) {
-                        node.subscribers
-                            .write()
-                            .retain(|&eid| eid != effect_id);
+                        node.subscribers.write().retain(|&eid| eid != effect_id);
                     }
                 }
             });
@@ -561,14 +559,17 @@ mod tests {
         effect.id().with_sources(|sources| {
             assert_eq!(sources.count(), 1);
         });
-        let has_signal = effect.id().with_sources(|sources| {
-            for s in sources {
-                if s == signal_node_id {
-                    return true;
+        let has_signal = effect
+            .id()
+            .with_sources(|sources| {
+                for s in sources {
+                    if s == signal_node_id {
+                        return true;
+                    }
                 }
-            }
-            false
-        }).unwrap_or(false);
+                false
+            })
+            .unwrap_or(false);
         assert!(has_signal);
 
         // Emit signal - schedules effect processing (debounced)

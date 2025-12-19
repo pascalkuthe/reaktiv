@@ -218,7 +218,10 @@ mod tests {
         });
 
         // Duplicate subscriptions are handled - the effect sees only one source
-        let source_count = effect.id().with_sources(|sources| sources.count()).unwrap_or(0);
+        let source_count = effect
+            .id()
+            .with_sources(|sources| sources.count())
+            .unwrap_or(0);
         assert_eq!(source_count, 1);
     }
 }

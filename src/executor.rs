@@ -111,6 +111,7 @@ pub const DEFAULT_BUDGET: Duration = Duration::from_millis(16);
 ///     })
 ///     .spawn();
 /// ```
+#[allow(clippy::type_complexity)]
 pub struct EffectLoop {
     debounce: Duration,
     max_debounce: Duration,

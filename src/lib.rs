@@ -141,7 +141,7 @@ pub use effect::{flush_effects, is_processing_scheduled, untracked};
 
 // Executor integration (for custom event loops)
 pub use executor::{
-    EffectLoop, DEFAULT_BUDGET, DEFAULT_DEBOUNCE, DEFAULT_MAX_DEBOUNCE, spawn_effect_loop,
+    DEFAULT_BUDGET, DEFAULT_DEBOUNCE, DEFAULT_MAX_DEBOUNCE, EffectLoop, spawn_effect_loop,
 };
 
 #[cfg(test)]

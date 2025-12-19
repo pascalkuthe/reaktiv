@@ -66,12 +66,15 @@ pub(crate) struct SignalRelation {
     pub(crate) is_output: bool,
 }
 
+/// Type alias for the inner filter map iterator over signal relations
+type SignalFilterMapIter<'a> = std::iter::FilterMap<
+    std::collections::hash_map::Iter<'a, SignalId, SignalRelation>,
+    fn((&'a SignalId, &'a SignalRelation)) -> Option<SignalId>,
+>;
+
 /// Iterator over source SignalIds for an effect
 pub struct SourcesIter<'a> {
-    inner: std::iter::FilterMap<
-        std::collections::hash_map::Iter<'a, SignalId, SignalRelation>,
-        fn((&'a SignalId, &'a SignalRelation)) -> Option<SignalId>,
-    >,
+    inner: SignalFilterMapIter<'a>,
 }
 
 impl Iterator for SourcesIter<'_> {
@@ -90,10 +93,7 @@ impl Iterator for SourcesIter<'_> {
 
 /// Iterator over output SignalIds for an effect
 pub struct OutputsIter<'a> {
-    inner: std::iter::FilterMap<
-        std::collections::hash_map::Iter<'a, SignalId, SignalRelation>,
-        fn((&'a SignalId, &'a SignalRelation)) -> Option<SignalId>,
-    >,
+    inner: SignalFilterMapIter<'a>,
 }
 
 impl Iterator for OutputsIter<'_> {
@@ -568,7 +568,7 @@ pub struct EffectMetadata {
 
     /// Flags bitset:
     /// - bit 0: skippable (can be deferred under load)
-    /// Note: The 'local' flag (for Python/GIL) is mentioned in comments but not currently used
+    ///   Note: The 'local' flag (for Python/GIL) is mentioned in comments but not currently used
     pub(crate) flags: u8,
 
     /// The effect callback function (None for computeds, Some for effects).
@@ -773,7 +773,7 @@ impl EffectMetadata {
         self.signals
             .read()
             .get(&signal_id)
-            .map_or(false, |r| r.is_source)
+            .is_some_and(|r| r.is_source)
     }
 
     /// Execute a closure with an iterator over sources

@@ -1,5 +1,6 @@
 /// Comprehensive POC tests demonstrating the reactive system
 use crate::{Computed, Effect, Signal, Transaction, flush_effects};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -377,7 +378,7 @@ fn effect_created_in_effect_becomes_child() {
     assert_eq!(child_runs.load(Ordering::Relaxed), 1);
 
     // Check that parent has a child
-    let child_count = parent_effect.id().with_children(|c| c.len()).unwrap_or(0);
+    let child_count = parent_effect.id().with_children(Vec::len).unwrap_or(0);
     assert_eq!(child_count, 1);
 }
 
@@ -421,7 +422,7 @@ fn children_destroyed_when_parent_reruns() {
     assert_eq!(child_creates.load(Ordering::Relaxed), 2);
 
     // Parent should still have exactly 1 child (the new one)
-    let child_count = parent_effect.id().with_children(|c| c.len()).unwrap_or(0);
+    let child_count = parent_effect.id().with_children(Vec::len).unwrap_or(0);
     assert_eq!(child_count, 1);
 }
 
@@ -528,11 +529,11 @@ fn deeply_nested_hierarchy_tracked_correctly() {
     assert_eq!(level2_runs.load(Ordering::Relaxed), 1);
 
     // Check hierarchy: root has 1 child, child has 1 grandchild
-    let child_count = root_effect.id().with_children(|c| c.len()).unwrap_or(0);
+    let child_count = root_effect.id().with_children(Vec::len).unwrap_or(0);
     assert_eq!(child_count, 1);
 
     let first_child_id = root_effect.id().with_children(|c| c[0]).unwrap();
-    let grandchild_count = first_child_id.with_children(|c| c.len()).unwrap_or(0);
+    let grandchild_count = first_child_id.with_children(Vec::len).unwrap_or(0);
     assert_eq!(grandchild_count, 1);
 }
 
@@ -570,7 +571,7 @@ fn children_destroyed_immediately_on_parent_invalidation() {
     assert_eq!(child_created.load(Ordering::Relaxed), 1);
 
     // Verify parent has one child
-    let child_count = parent_effect.id().with_children(|c| c.len()).unwrap_or(0);
+    let child_count = parent_effect.id().with_children(Vec::len).unwrap_or(0);
     assert_eq!(child_count, 1);
 
     // Mark parent as dirty (via invalidate) inside a transaction so it doesn't auto-run
@@ -580,7 +581,7 @@ fn children_destroyed_immediately_on_parent_invalidation() {
 
         // IMPORTANT: Children should be destroyed IMMEDIATELY when parent is marked dirty,
         // NOT when parent re-runs. Verify child is already gone from parent's children list.
-        let child_count_after = parent_effect.id().with_children(|c| c.len()).unwrap_or(0);
+        let child_count_after = parent_effect.id().with_children(Vec::len).unwrap_or(0);
         assert_eq!(
             child_count_after, 0,
             "Children should be destroyed immediately when parent is marked dirty"
@@ -595,7 +596,7 @@ fn children_destroyed_immediately_on_parent_invalidation() {
     assert_eq!(child_created.load(Ordering::Relaxed), 2);
 
     // Verify parent has one (new) child again
-    let new_child_count = parent_effect.id().with_children(|c| c.len()).unwrap_or(0);
+    let new_child_count = parent_effect.id().with_children(Vec::len).unwrap_or(0);
     assert_eq!(new_child_count, 1);
 }
 
@@ -927,7 +928,7 @@ fn deeply_nested_hierarchy_stress() {
     root_effect.invalidate();
 
     // Root should have no children (destroyed when marked pending)
-    let child_count = root_effect.id().with_children(|c| c.len()).unwrap_or(0);
+    let child_count = root_effect.id().with_children(Vec::len).unwrap_or(0);
     assert_eq!(
         child_count, 0,
         "Children should be destroyed when parent is marked pending"
@@ -1365,14 +1366,14 @@ fn effect_creates_sibling_effects() {
     assert_eq!(child_count.load(Ordering::Relaxed), 3);
 
     // Verify parent has 3 children
-    let child_count_check = parent.id().with_children(|c| c.len()).unwrap_or(0);
+    let child_count_check = parent.id().with_children(Vec::len).unwrap_or(0);
     assert_eq!(child_count_check, 3);
 
     // Signal emits - parent marked pending, children destroyed
     signal.emit();
 
     // Before flush, children should already be destroyed
-    let child_count_after_emit = parent.id().with_children(|c| c.len()).unwrap_or(0);
+    let child_count_after_emit = parent.id().with_children(Vec::len).unwrap_or(0);
     assert_eq!(
         child_count_after_emit, 0,
         "Children destroyed when parent marked pending"
@@ -1385,7 +1386,7 @@ fn effect_creates_sibling_effects() {
     assert_eq!(child_count.load(Ordering::Relaxed), 6);
 
     // Parent should have 3 (new) children
-    let new_child_count = parent.id().with_children(|c| c.len()).unwrap_or(0);
+    let new_child_count = parent.id().with_children(Vec::len).unwrap_or(0);
     assert_eq!(new_child_count, 3);
 }
 
@@ -1423,7 +1424,10 @@ fn effect_writing_tracked_as_output() {
     assert_eq!(counter.load(Ordering::Relaxed), 1);
 
     // Check that output_signal is in effect's outputs (emit() tracks it)
-    let output_count = effect.id().with_outputs(|outputs| outputs.count()).unwrap_or(0);
+    let output_count = effect
+        .id()
+        .with_outputs(|outputs| outputs.count())
+        .unwrap_or(0);
     assert_eq!(output_count, 1);
 }
 
@@ -1446,20 +1450,29 @@ fn effect_emit_tracked_as_output() {
     });
 
     // Verify the effect has input_signal as source
-    let source_count = effect.id().with_sources(|sources| sources.count()).unwrap_or(0);
+    let source_count = effect
+        .id()
+        .with_sources(|sources| sources.count())
+        .unwrap_or(0);
     assert_eq!(source_count, 1);
-    let has_input_source = effect.id().with_sources(|sources| {
-        for s in sources {
-            if s == input_signal_id {
-                return true;
+    let has_input_source = effect
+        .id()
+        .with_sources(|sources| {
+            for s in sources {
+                if s == input_signal_id {
+                    return true;
+                }
             }
-        }
-        false
-    }).unwrap_or(false);
+            false
+        })
+        .unwrap_or(false);
     assert!(has_input_source);
 
     // No outputs yet since we didn't actually call emit()
-    let output_count = effect.id().with_outputs(|outputs| outputs.count()).unwrap_or(0);
+    let output_count = effect
+        .id()
+        .with_outputs(|outputs| outputs.count())
+        .unwrap_or(0);
     assert_eq!(output_count, 0);
 
     // Check signal writers
@@ -1484,18 +1497,19 @@ fn untracked_prevents_dependency() {
     });
 
     // Effect should have NO sources (untracked prevented dependency tracking)
-    let source_count = effect.id().with_sources(|sources| sources.count()).unwrap_or(0);
+    let source_count = effect
+        .id()
+        .with_sources(|sources| sources.count())
+        .unwrap_or(0);
     assert_eq!(
-        source_count,
-        0,
+        source_count, 0,
         "untracked() should prevent dependency tracking"
     );
 
     // Signal should have NO subscribers
-    let subscriber_count = signal_id.with_subscribers(|subs| subs.len()).unwrap_or(0);
+    let subscriber_count = signal_id.with_subscribers(HashSet::len).unwrap_or(0);
     assert_eq!(
-        subscriber_count,
-        0,
+        subscriber_count, 0,
         "untracked() should prevent subscription"
     );
 }
@@ -1937,9 +1951,8 @@ fn check_state_effects_added_to_pending() {
         assert_eq!(
             b_count.load(Ordering::Relaxed),
             i,
-            "Effect B should run on emission {}. \
-             If this fails, Check-state effects may not be added to the pending set.",
-            i
+            "Effect B should run on emission {i}. \
+             If this fails, Check-state effects may not be added to the pending set."
         );
     }
 }
@@ -1997,8 +2010,7 @@ fn check_state_propagation_through_chain() {
         assert_eq!(
             c_count.load(Ordering::Relaxed),
             i,
-            "Effect C should run on emission {}",
-            i
+            "Effect C should run on emission {i}"
         );
     }
 }
